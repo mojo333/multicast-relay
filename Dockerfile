@@ -7,5 +7,6 @@ FROM python:3-alpine
 COPY --from=build /netifaces*.whl /tmp
 RUN pip install /tmp/netifaces*.whl
 COPY multicast-relay.py /
+COPY start.sh /
 
-ENTRYPOINT [ "python", "multicast-relay.py", "--foreground" ]
+ENTRYPOINT [ "sh", "start.sh", "--foreground" ]
