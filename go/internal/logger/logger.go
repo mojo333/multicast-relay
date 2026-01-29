@@ -30,7 +30,7 @@ func New(foreground bool, logfile string, verbose bool) (*Logger, error) {
 	}
 
 	if logfile != "" {
-		f, err := os.OpenFile(logfile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		f, err := os.OpenFile(logfile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 		if err != nil {
 			return nil, fmt.Errorf("cannot open logfile %s: %w", logfile, err)
 		}

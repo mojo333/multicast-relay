@@ -6,12 +6,13 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
+	"errors"
 	"io"
 )
 
 // Cipher handles AES-256-CTR encryption and decryption.
 type Cipher struct {
-	key       []byte
+	block     cipher.Block
 	blockSize int
 	enabled   bool
 }
@@ -23,7 +24,13 @@ func New(key string) *Cipher {
 		return c
 	}
 	hash := sha256.Sum256([]byte(key))
-	c.key = hash[:]
+	block, err := aes.NewCipher(hash[:])
+	if err != nil {
+		// sha256 always produces 32 bytes, which is a valid AES-256 key,
+		// so this should never happen.
+		panic("cipher: failed to create AES block: " + err.Error())
+	}
+	c.block = block
 	c.blockSize = aes.BlockSize
 	c.enabled = true
 	return c
@@ -35,21 +42,16 @@ func (c *Cipher) Encrypt(plaintext []byte) ([]byte, error) {
 		return plaintext, nil
 	}
 
-	block, err := aes.NewCipher(c.key)
-	if err != nil {
-		return nil, err
-	}
-
 	iv := make([]byte, c.blockSize)
 	if _, err := io.ReadFull(rand.Reader, iv); err != nil {
 		return nil, err
 	}
 
-	ciphertext := make([]byte, len(iv)+len(plaintext))
+	ciphertext := make([]byte, c.blockSize+len(plaintext))
 	copy(ciphertext, iv)
 
-	stream := cipher.NewCTR(block, iv)
-	stream.XORKeyStream(ciphertext[len(iv):], plaintext)
+	stream := cipher.NewCTR(c.block, iv)
+	stream.XORKeyStream(ciphertext[c.blockSize:], plaintext)
 
 	return ciphertext, nil
 }
@@ -60,20 +62,15 @@ func (c *Cipher) Decrypt(ciphertext []byte) ([]byte, error) {
 		return ciphertext, nil
 	}
 
-	block, err := aes.NewCipher(c.key)
-	if err != nil {
-		return nil, err
-	}
-
 	if len(ciphertext) < c.blockSize {
-		return nil, err
+		return nil, errors.New("cipher: ciphertext too short")
 	}
 
 	iv := ciphertext[:c.blockSize]
 	data := ciphertext[c.blockSize:]
 
 	plaintext := make([]byte, len(data))
-	stream := cipher.NewCTR(block, iv)
+	stream := cipher.NewCTR(c.block, iv)
 	stream.XORKeyStream(plaintext, data)
 
 	return plaintext, nil

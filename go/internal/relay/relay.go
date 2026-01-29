@@ -2,13 +2,14 @@
 package relay
 
 import (
+	"bytes"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -31,11 +32,33 @@ const (
 	MDNSMcastAddr   = "224.0.0.251"
 	MDNSMcastPort   = 5353
 
-	udpMaxLength = 1458
-	ipv4Len      = 4
+	udpMaxLength       = 1458
+	maxRecentChecksums = 256
 )
 
-var magic = []byte("MRLY")
+var (
+	magicBytes = [4]byte{'M', 'R', 'L', 'Y'}
+	zeroMAC    = net.HardwareAddr{0, 0, 0, 0, 0, 0}
+
+	// Pre-compiled regexes for hot paths.
+	ssdpSearchRe = regexp.MustCompile(`M-SEARCH|NOTIFY`)
+	ipAddrRe     = regexp.MustCompile(`^\d+\.\d+\.\d+\.\d+$`)
+	cidrRe       = regexp.MustCompile(`^\d+\.\d+\.\d+\.\d+/\d+$`)
+)
+
+// ssdpSearchSource tracks the most recent SSDP search source for unicast reply routing.
+type ssdpSearchSource struct {
+	addr string
+	port uint16
+	set  bool
+}
+
+// parsedFilter is a pre-parsed ifFilter entry.
+type parsedFilter struct {
+	network string
+	netmask string
+	ifaces  []string
+}
 
 // RelayAddr stores a multicast/broadcast address and port pair.
 type RelayAddr struct {
@@ -70,45 +93,49 @@ type RemoteAddr struct {
 
 // Config holds all configuration for the PacketRelay.
 type Config struct {
-	Interfaces          []string
+	Interfaces           []string
 	NoTransmitInterfaces []string
-	IfFilter            string
-	WaitForIP           bool
-	TTL                 int
-	OneInterface        bool
-	AllowNonEther       bool
-	SSDPUnicastAddr     string
-	MDNSForceUnicast    bool
-	Masquerade          []string
-	Listen              []string
-	Remote              []string
-	RemotePort          int
-	RemoteRetry         int
-	NoRemoteRelay       bool
-	AESKey              string
-	Logger              *logger.Logger
+	IfFilter             string
+	WaitForIP            bool
+	TTL                  int
+	OneInterface         bool
+	AllowNonEther        bool
+	SSDPUnicastAddr      string
+	MDNSForceUnicast     bool
+	Masquerade           []string
+	Listen               []string
+	Remote               []string
+	RemotePort           int
+	RemoteRetry          int
+	NoRemoteRelay        bool
+	AESKey               string
+	Logger               *logger.Logger
 }
 
 // PacketRelay is the main relay engine.
 type PacketRelay struct {
 	interfaces           []string
-	noTransmitInterfaces []string
-	ifFilter             map[string][]string
+	noTransmitInterfaces map[string]bool
+	parsedFilters        []parsedFilter
 	ssdpUnicastAddr      string
 	mdnsForceUnicast     bool
 	wait                 bool
 	ttl                  int
 	oneInterface         bool
 	allowNonEther        bool
-	masquerade           []string
+	masquerade           map[string]bool
 
 	logger *logger.Logger
 
-	transmitters    []Transmitter
-	receivers       []Receiver
-	etherAddrs      map[string]net.HardwareAddr
-	etherType       []byte
-	recentChecksums []uint16
+	transmitters []Transmitter
+	receivers    []Receiver
+	etherAddrs   map[string]net.HardwareAddr
+	etherType    [2]byte
+
+	// Ring buffer for duplicate detection.
+	recentChecksums [maxRecentChecksums]uint16
+	checksumIdx     int
+	checksumCount   int
 	mu              sync.Mutex
 
 	listenAddr        []string
@@ -119,41 +146,52 @@ type PacketRelay struct {
 	noRemoteRelay     bool
 	aes               *cipher.Cipher
 	remoteConnections []net.Conn
+
+	// Pre-allocated poll structures rebuilt when receivers change.
+	pollFds []unix.PollFd
+	fdRoles []string // parallel to pollFds: "listen" or "receiver"
+	pollDirty bool
 }
 
 // New creates and initializes a new PacketRelay.
 func New(cfg Config) (*PacketRelay, error) {
+	noTx := make(map[string]bool, len(cfg.NoTransmitInterfaces))
+	for _, nt := range cfg.NoTransmitInterfaces {
+		noTx[nt] = true
+	}
+	masq := make(map[string]bool, len(cfg.Masquerade))
+	for _, m := range cfg.Masquerade {
+		masq[m] = true
+	}
+
 	pr := &PacketRelay{
 		interfaces:           cfg.Interfaces,
-		noTransmitInterfaces: cfg.NoTransmitInterfaces,
-		ifFilter:             make(map[string][]string),
+		noTransmitInterfaces: noTx,
 		ssdpUnicastAddr:      cfg.SSDPUnicastAddr,
 		mdnsForceUnicast:     cfg.MDNSForceUnicast,
 		wait:                 cfg.WaitForIP,
 		ttl:                  cfg.TTL,
 		oneInterface:         cfg.OneInterface,
 		allowNonEther:        cfg.AllowNonEther,
-		masquerade:           cfg.Masquerade,
+		masquerade:           masq,
 		logger:               cfg.Logger,
 		etherAddrs:           make(map[string]net.HardwareAddr),
-		etherType:            []byte{0x08, 0x00}, // IPv4
+		etherType:            [2]byte{0x08, 0x00}, // IPv4
 		listenFd:             -1,
 		listenAddr:           cfg.Listen,
 		remotePort:           cfg.RemotePort,
 		remoteRetry:          cfg.RemoteRetry,
 		noRemoteRelay:        cfg.NoRemoteRelay,
 		aes:                  cipher.New(cfg.AESKey),
+		pollDirty:            true,
 	}
 
 	if cfg.IfFilter != "" {
-		data, err := os.ReadFile(cfg.IfFilter)
+		rawFilters, err := parseIfFilterFile(cfg.IfFilter)
 		if err != nil {
-			return nil, fmt.Errorf("cannot read ifFilter file %s: %w", cfg.IfFilter, err)
+			return nil, err
 		}
-		cleaned := strings.ReplaceAll(strings.TrimSpace(string(data)), "\n", " ")
-		if err := json.Unmarshal([]byte(cleaned), &pr.ifFilter); err != nil {
-			return nil, fmt.Errorf("cannot parse ifFilter JSON: %w", err)
-		}
+		pr.parsedFilters = rawFilters
 	}
 
 	if cfg.Remote != nil {
@@ -168,10 +206,12 @@ func New(cfg Config) (*PacketRelay, error) {
 		if err != nil {
 			return nil, fmt.Errorf("cannot create listen socket: %w", err)
 		}
-		unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+		if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
+			unix.Close(fd)
+			return nil, fmt.Errorf("cannot set SO_REUSEADDR: %w", err)
+		}
 
 		sa := &unix.SockaddrInet4{Port: pr.remotePort}
-		// bind to 0.0.0.0
 		if err := unix.Bind(fd, sa); err != nil {
 			unix.Close(fd)
 			return nil, fmt.Errorf("cannot bind listen socket: %w", err)
@@ -186,6 +226,37 @@ func New(cfg Config) (*PacketRelay, error) {
 	}
 
 	return pr, nil
+}
+
+// parseIfFilterFile reads and pre-parses the ifFilter JSON file into network/netmask pairs.
+func parseIfFilterFile(path string) ([]parsedFilter, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read ifFilter file %s: %w", path, err)
+	}
+	var raw map[string][]string
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("cannot parse ifFilter JSON: %w", err)
+	}
+	var filters []parsedFilter
+	for netStr, ifaces := range raw {
+		parts := strings.SplitN(netStr, "/", 2)
+		network := parts[0]
+		bits := 32
+		if len(parts) == 2 {
+			b, err := strconv.Atoi(parts[1])
+			if err != nil {
+				return nil, fmt.Errorf("invalid CIDR bits in ifFilter key %q: %w", netStr, err)
+			}
+			bits = b
+		}
+		filters = append(filters, parsedFilter{
+			network: network,
+			netmask: CIDRToNetmask(bits),
+			ifaces:  ifaces,
+		})
+	}
+	return filters, nil
 }
 
 // AddListener sets up receive and transmit sockets for a relay address.
@@ -205,7 +276,10 @@ func (pr *PacketRelay) AddListener(addr string, port int, service string) error 
 		if err != nil {
 			return fmt.Errorf("cannot create multicast receive socket: %w", err)
 		}
-		unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+		if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
+			unix.Close(fd)
+			return fmt.Errorf("cannot set SO_REUSEADDR: %w", err)
+		}
 		multicastRxFd = fd
 	}
 
@@ -220,8 +294,14 @@ func (pr *PacketRelay) AddListener(addr string, port int, service string) error 
 			if err != nil {
 				return fmt.Errorf("cannot create broadcast receive socket: %w", err)
 			}
-			unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
-			unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_BROADCAST, 1)
+			if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
+				unix.Close(fd)
+				return fmt.Errorf("cannot set SO_REUSEADDR: %w", err)
+			}
+			if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_BROADCAST, 1); err != nil {
+				unix.Close(fd)
+				return fmt.Errorf("cannot set SO_BROADCAST: %w", err)
+			}
 
 			bcastIP := net.ParseIP(ifInfo.Broadcast).To4()
 			sa := &unix.SockaddrInet4{Port: port}
@@ -235,14 +315,16 @@ func (pr *PacketRelay) AddListener(addr string, port int, service string) error 
 		} else if IsMulticast(addr) {
 			mcastIP := net.ParseIP(addr).To4()
 			ifIP := net.ParseIP(ifInfo.IP).To4()
-			mreq := make([]byte, 8)
-			copy(mreq[0:4], mcastIP)
-			copy(mreq[4:8], ifIP)
-			unix.SetsockoptString(multicastRxFd, unix.SOL_IP, unix.IP_ADD_MEMBERSHIP, string(mreq))
+			mreq := &unix.IPMreq{}
+			copy(mreq.Multiaddr[:], mcastIP)
+			copy(mreq.Interface[:], ifIP)
+			if err := unix.SetsockoptIPMreq(multicastRxFd, unix.SOL_IP, unix.IP_ADD_MEMBERSHIP, mreq); err != nil {
+				return fmt.Errorf("cannot join multicast group %s on %s: %w", addr, ifInfo.Name, err)
+			}
 		}
 
 		// Create transmitter for this interface (unless in noTransmitInterfaces)
-		if !pr.isNoTransmit(iface) {
+		if !pr.noTransmitInterfaces[iface] {
 			txFd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_ALL)))
 			if err != nil {
 				return fmt.Errorf("cannot create transmit socket for %s: %w", ifInfo.Name, err)
@@ -292,12 +374,36 @@ func (pr *PacketRelay) AddListener(addr string, port int, service string) error 
 		pr.receivers = append(pr.receivers, Receiver{fd: multicastRxFd})
 	}
 
+	pr.pollDirty = true
 	return nil
+}
+
+// rebuildPollFds rebuilds the pre-allocated poll fd set.
+func (pr *PacketRelay) rebuildPollFds() {
+	count := len(pr.receivers)
+	if pr.listenFd >= 0 {
+		count++
+	}
+
+	pr.pollFds = make([]unix.PollFd, 0, count)
+	pr.fdRoles = make([]string, 0, count)
+
+	if pr.listenFd >= 0 {
+		pr.pollFds = append(pr.pollFds, unix.PollFd{Fd: int32(pr.listenFd), Events: unix.POLLIN})
+		pr.fdRoles = append(pr.fdRoles, "listen")
+	}
+
+	for _, rx := range pr.receivers {
+		pr.pollFds = append(pr.pollFds, unix.PollFd{Fd: int32(rx.fd), Events: unix.POLLIN})
+		pr.fdRoles = append(pr.fdRoles, "receiver")
+	}
+
+	pr.pollDirty = false
 }
 
 // Loop runs the main packet relay event loop.
 func (pr *PacketRelay) Loop() error {
-	recentSsdpSearchSrc := map[string]interface{}{}
+	var ssdpSrc ssdpSearchSource
 
 	buf := make([]byte, 10240)
 
@@ -306,27 +412,21 @@ func (pr *PacketRelay) Loop() error {
 			pr.connectRemotes()
 		}
 
-		// Build the poll set
-		fds := []unix.PollFd{}
-		fdMap := map[int]string{} // fd -> "listen", "remote", "receiver"
-
-		if pr.listenFd >= 0 {
-			fds = append(fds, unix.PollFd{Fd: int32(pr.listenFd), Events: unix.POLLIN})
-			fdMap[pr.listenFd] = "listen"
+		if pr.pollDirty {
+			pr.rebuildPollFds()
 		}
 
-		// We can't easily poll on net.Conn, so for remote connections we use a goroutine approach below
-		for _, rx := range pr.receivers {
-			fds = append(fds, unix.PollFd{Fd: int32(rx.fd), Events: unix.POLLIN})
-			fdMap[rx.fd] = "receiver"
-		}
-
-		if len(fds) == 0 {
+		if len(pr.pollFds) == 0 {
 			time.Sleep(time.Second)
 			continue
 		}
 
-		n, err := unix.Poll(fds, 1000) // 1 second timeout
+		// Clear revents before polling
+		for i := range pr.pollFds {
+			pr.pollFds[i].Revents = 0
+		}
+
+		n, err := unix.Poll(pr.pollFds, 1000) // 1 second timeout
 		if err != nil {
 			if err == unix.EINTR {
 				continue
@@ -337,19 +437,18 @@ func (pr *PacketRelay) Loop() error {
 			continue
 		}
 
-		for _, pfd := range fds {
+		for i, pfd := range pr.pollFds {
 			if pfd.Revents&unix.POLLIN == 0 {
 				continue
 			}
-			fd := int(pfd.Fd)
 
-			if fdMap[fd] == "listen" {
-				pr.handleListenAccept(fd)
+			if pr.fdRoles[i] == "listen" {
+				pr.handleListenAccept(int(pfd.Fd))
 				continue
 			}
 
 			// Local receiver
-			nread, from, err := unix.Recvfrom(fd, buf, 0)
+			nread, from, err := unix.Recvfrom(int(pfd.Fd), buf, 0)
 			if err != nil {
 				pr.logger.Info("Error receiving packet: %s", err)
 				continue
@@ -361,35 +460,44 @@ func (pr *PacketRelay) Loop() error {
 			data := make([]byte, nread)
 			copy(data, buf[:nread])
 
-			var senderAddr string
-			if sa, ok := from.(*unix.SockaddrInet4); ok {
-				senderAddr = net.IP(sa.Addr[:]).String()
-			} else {
+			sa, ok := from.(*unix.SockaddrInet4)
+			if !ok {
 				continue
 			}
+			senderAddr := net.IP(sa.Addr[:]).String()
 
-			pr.processPacket(data, senderAddr, "local", recentSsdpSearchSrc)
+			pr.processPacket(data, senderAddr, "local", &ssdpSrc)
 		}
 	}
 }
 
-func (pr *PacketRelay) processPacket(data []byte, senderAddr string, receivingInterface string, recentSsdpSearchSrc map[string]interface{}) {
+func (pr *PacketRelay) processPacket(data []byte, senderAddr string, receivingInterface string, ssdpSrc *ssdpSearchSource) {
 	if len(data) < 28 { // min IP header + UDP header
 		return
 	}
 
 	// Forward to remote connections
-	if len(pr.remoteSockets()) > 0 && !(receivingInterface == "remote" && pr.noRemoteRelay) {
-		packet := append(magic, net.ParseIP(senderAddr).To4()...)
-		packet = append(packet, data...)
-		encrypted, err := pr.aes.Encrypt(packet)
-		if err == nil {
-			sizeHeader := make([]byte, 2)
-			binary.BigEndian.PutUint16(sizeHeader, uint16(len(encrypted)))
-			payload := append(sizeHeader, encrypted...)
+	remotes := pr.remoteSockets()
+	if len(remotes) > 0 && !(receivingInterface == "remote" && pr.noRemoteRelay) {
+		senderIP := net.ParseIP(senderAddr).To4()
+		if senderIP != nil {
+			// Build packet without mutating magicBytes
+			packet := make([]byte, 0, len(magicBytes)+4+len(data))
+			packet = append(packet, magicBytes[:]...)
+			packet = append(packet, senderIP...)
+			packet = append(packet, data...)
 
-			for _, conn := range pr.remoteSockets() {
-				conn.Write(payload)
+			encrypted, err := pr.aes.Encrypt(packet)
+			if err == nil {
+				payload := make([]byte, 2+len(encrypted))
+				binary.BigEndian.PutUint16(payload[0:2], uint16(len(encrypted)))
+				copy(payload[2:], encrypted)
+
+				for _, conn := range remotes {
+					if _, err := conn.Write(payload); err != nil {
+						pr.logger.Info("REMOTE: Write error: %s", err)
+					}
+				}
 			}
 		}
 	}
@@ -402,14 +510,9 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr string, receivingIn
 
 	// Duplicate detection via IP checksum
 	ipChecksum := binary.BigEndian.Uint16(data[10:12])
-	pr.mu.Lock()
-	for _, cs := range pr.recentChecksums {
-		if cs == ipChecksum {
-			pr.mu.Unlock()
-			return
-		}
+	if pr.isDuplicate(ipChecksum) {
+		return
 	}
-	pr.mu.Unlock()
 
 	srcAddr := net.IP(data[12:16]).String()
 	dstAddr := net.IP(data[16:20]).String()
@@ -435,21 +538,21 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr string, receivingIn
 	}
 
 	// SSDP M-SEARCH / NOTIFY interception
-	ssdpSearch := regexp.MustCompile(`M-SEARCH|NOTIFY`)
-	if pr.ssdpUnicastAddr != "" && dstAddr == SSDPMcastAddr && dstPort == SSDPMcastPort && ssdpSearch.Match(data) {
-		recentSsdpSearchSrc["addr"] = srcAddr
-		recentSsdpSearchSrc["port"] = srcPort
+	if pr.ssdpUnicastAddr != "" && dstAddr == SSDPMcastAddr && dstPort == SSDPMcastPort && ssdpSearchRe.Match(data) {
+		ssdpSrc.addr = srcAddr
+		ssdpSrc.port = srcPort
+		ssdpSrc.set = true
 		pr.logger.Info("Last SSDP search source: %s:%d", srcAddr, srcPort)
 
 		srcAddr = pr.ssdpUnicastAddr
 		srcPort = SSDPUnicastPort
 		data = ModifyUDPPacket(data, ipHeaderLength, srcAddr, srcPort, "", 0)
 	} else if pr.ssdpUnicastAddr != "" && origDstAddr == pr.ssdpUnicastAddr && origDstPort == SSDPUnicastPort {
-		if _, ok := recentSsdpSearchSrc["addr"]; !ok {
+		if !ssdpSrc.set {
 			return
 		}
-		dstAddr = recentSsdpSearchSrc["addr"].(string)
-		dstPort = recentSsdpSearchSrc["port"].(uint16)
+		dstAddr = ssdpSrc.addr
+		dstPort = ssdpSrc.port
 		pr.logger.Info("Received SSDP Unicast - received from %s:%d on %s:%d, need to relay to %s:%d",
 			origSrcAddr, origSrcPort, origDstAddr, origDstPort, dstAddr, dstPort)
 
@@ -488,32 +591,7 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr string, receivingIn
 		}
 
 		// Apply ifFilter
-		transmit := true
-		for netStr, allowedIfaces := range pr.ifFilter {
-			parts := strings.SplitN(netStr, "/", 2)
-			network := parts[0]
-			maskBits := "32"
-			if len(parts) == 2 {
-				maskBits = parts[1]
-			}
-			var bits int
-			fmt.Sscanf(maskBits, "%d", &bits)
-			netmask := CIDRToNetmask(bits)
-			if OnNetwork(srcAddr, network, netmask) {
-				found := false
-				for _, iface := range allowedIfaces {
-					if iface == tx.Interface {
-						found = true
-						break
-					}
-				}
-				if !found {
-					transmit = false
-				}
-				break
-			}
-		}
-		if !transmit {
+		if !pr.isAllowedByFilter(srcAddr, tx.Interface) {
 			continue
 		}
 
@@ -540,7 +618,8 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr string, receivingIn
 			txData := make([]byte, len(data))
 			copy(txData, data)
 
-			if pr.isMasquerade(tx.Interface) {
+			isMasq := pr.masquerade[tx.Interface]
+			if isMasq {
 				copy(txData[12:16], net.ParseIP(tx.Addr).To4())
 			}
 
@@ -549,7 +628,7 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr string, receivingIn
 				servicePrefix = fmt.Sprintf("[%s] ", tx.Service)
 			}
 			action := "Relayed"
-			if pr.isMasquerade(tx.Interface) {
+			if isMasq {
 				action = "Masqueraded"
 			}
 			plural := "s"
@@ -564,30 +643,92 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr string, receivingIn
 			if err := pr.transmitPacket(tx, localDestMac, ipHeaderLength, txData); err != nil {
 				// Try to recover if ENXIO (device not configured)
 				if isENXIO(err) {
-					pr.logger.Info("Attempting to recover interface %s", tx.Interface)
-					ifInfo, recoverErr := pr.getInterface(tx.Interface)
-					if recoverErr == nil {
-						newFd, sockErr := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_ALL)))
-						if sockErr == nil {
-							ifIdx, _ := interfaceIndex(ifInfo.Name)
-							sa := &unix.SockaddrLinklayer{
-								Protocol: htons(unix.ETH_P_ALL),
-								Ifindex:  ifIdx,
-							}
-							unix.Bind(newFd, sa)
-							unix.Close(tx.Socket)
-							tx.Socket = newFd
-							tx.MAC = ifInfo.MAC
-							tx.Netmask = ifInfo.Netmask
-							tx.Addr = ifInfo.IP
-							pr.transmitPacket(tx, localDestMac, ipHeaderLength, txData)
-						}
-					}
+					pr.recoverTransmitter(tx, localDestMac, ipHeaderLength, txData)
 				} else {
 					pr.logger.Info("Error sending packet: %s", err)
 				}
 			}
 		}
+	}
+}
+
+// isDuplicate checks whether this checksum was recently seen.
+func (pr *PacketRelay) isDuplicate(checksum uint16) bool {
+	pr.mu.Lock()
+	defer pr.mu.Unlock()
+	n := pr.checksumCount
+	if n > maxRecentChecksums {
+		n = maxRecentChecksums
+	}
+	for i := 0; i < n; i++ {
+		if pr.recentChecksums[i] == checksum {
+			return true
+		}
+	}
+	return false
+}
+
+// addChecksum records a checksum in the ring buffer.
+func (pr *PacketRelay) addChecksum(checksum uint16) {
+	pr.mu.Lock()
+	pr.recentChecksums[pr.checksumIdx] = checksum
+	pr.checksumIdx = (pr.checksumIdx + 1) % maxRecentChecksums
+	if pr.checksumCount < maxRecentChecksums {
+		pr.checksumCount++
+	}
+	pr.mu.Unlock()
+}
+
+// isAllowedByFilter checks the pre-parsed ifFilter rules.
+func (pr *PacketRelay) isAllowedByFilter(srcAddr, txInterface string) bool {
+	for _, f := range pr.parsedFilters {
+		if OnNetwork(srcAddr, f.network, f.netmask) {
+			for _, iface := range f.ifaces {
+				if iface == txInterface {
+					return true
+				}
+			}
+			return false
+		}
+	}
+	return true
+}
+
+// recoverTransmitter attempts to re-create the transmit socket after ENXIO.
+func (pr *PacketRelay) recoverTransmitter(tx *Transmitter, destMac net.HardwareAddr, ipHeaderLength int, data []byte) {
+	pr.logger.Info("Attempting to recover interface %s", tx.Interface)
+	ifInfo, err := pr.getInterface(tx.Interface)
+	if err != nil {
+		pr.logger.Info("Recovery failed for %s: %s", tx.Interface, err)
+		return
+	}
+	newFd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_ALL)))
+	if err != nil {
+		pr.logger.Info("Recovery socket creation failed for %s: %s", tx.Interface, err)
+		return
+	}
+	ifIdx, err := interfaceIndex(ifInfo.Name)
+	if err != nil {
+		unix.Close(newFd)
+		pr.logger.Info("Recovery interface index failed for %s: %s", tx.Interface, err)
+		return
+	}
+	sa := &unix.SockaddrLinklayer{
+		Protocol: htons(unix.ETH_P_ALL),
+		Ifindex:  ifIdx,
+	}
+	if err := unix.Bind(newFd, sa); err != nil {
+		unix.Close(newFd)
+		pr.logger.Info("Recovery bind failed for %s: %s", tx.Interface, err)
+		return
+	}
+	unix.Close(tx.Socket)
+	tx.Socket = newFd
+	tx.MAC = ifInfo.MAC
+	tx.Netmask = ifInfo.Netmask
+	tx.Addr = ifInfo.IP
+	if err := pr.transmitPacket(tx, destMac, ipHeaderLength, data); err != nil {
+		pr.logger.Info("Recovery retransmit failed for %s: %s", tx.Interface, err)
 	}
 }
 
@@ -599,8 +740,6 @@ func (pr *PacketRelay) transmitPacket(tx *Transmitter, destMac net.HardwareAddr,
 	dontFragment := (data[6] & 0x40) >> 6
 
 	udpHeader = ComputeUDPChecksum(ipHeader, udpHeader, payload)
-
-	zeroMAC := net.HardwareAddr{0, 0, 0, 0, 0, 0}
 
 	for boundary := 0; boundary < len(payload); boundary += udpMaxLength {
 		end := boundary + udpMaxLength
@@ -633,20 +772,15 @@ func (pr *PacketRelay) transmitPacket(tx *Transmitter, destMac net.HardwareAddr,
 
 		// Track checksum for duplicate detection
 		cs := binary.BigEndian.Uint16(ipPacket[10:12])
-		pr.mu.Lock()
-		pr.recentChecksums = append(pr.recentChecksums, cs)
-		if len(pr.recentChecksums) > 256 {
-			pr.recentChecksums = pr.recentChecksums[1:]
-		}
-		pr.mu.Unlock()
+		pr.addChecksum(cs)
 
 		var packet []byte
-		if !macEqual(tx.MAC, zeroMAC) {
+		if !bytes.Equal(tx.MAC, zeroMAC) {
 			// Prepend ethernet header: destMac + srcMac + etherType
 			packet = make([]byte, 0, 14+len(ipPacket))
 			packet = append(packet, destMac...)
 			packet = append(packet, tx.MAC...)
-			packet = append(packet, pr.etherType...)
+			packet = append(packet, pr.etherType[:]...)
 			packet = append(packet, ipPacket...)
 		} else {
 			packet = ipPacket
@@ -678,14 +812,14 @@ func (pr *PacketRelay) getInterface(iface string) (*InterfaceResult, error) {
 
 	// Try as IP address
 	if err != nil {
-		if matched, _ := regexp.MatchString(`^\d+\.\d+\.\d+\.\d+$`, iface); matched {
+		if ipAddrRe.MatchString(iface) {
 			info, err = netifaces.FindByIP(iface)
 		}
 	}
 
 	// Try as CIDR
 	if err != nil {
-		if matched, _ := regexp.MatchString(`^\d+\.\d+\.\d+\.\d+/\d+$`, iface); matched {
+		if cidrRe.MatchString(iface) {
 			info, err = netifaces.FindByCIDR(iface)
 		}
 	}
@@ -719,8 +853,8 @@ func (pr *PacketRelay) getInterface(iface string) (*InterfaceResult, error) {
 		return nil, fmt.Errorf("unable to detect MAC address for interface %s", info.Name)
 	}
 
+	// Convert IPMask to dotted-quad notation
 	netmask := net.IP(info.Netmask).String()
-	// net.IPMask.String() returns hex, convert to dotted notation
 	if len(info.Netmask) == 4 {
 		netmask = fmt.Sprintf("%d.%d.%d.%d", info.Netmask[0], info.Netmask[1], info.Netmask[2], info.Netmask[3])
 	}
@@ -734,24 +868,6 @@ func (pr *PacketRelay) getInterface(iface string) (*InterfaceResult, error) {
 		Netmask:   netmask,
 		Broadcast: broadcast,
 	}, nil
-}
-
-func (pr *PacketRelay) isNoTransmit(iface string) bool {
-	for _, nt := range pr.noTransmitInterfaces {
-		if nt == iface {
-			return true
-		}
-	}
-	return false
-}
-
-func (pr *PacketRelay) isMasquerade(iface string) bool {
-	for _, m := range pr.masquerade {
-		if m == iface {
-			return true
-		}
-	}
-	return false
 }
 
 func (pr *PacketRelay) remoteSockets() []net.Conn {
@@ -833,6 +949,7 @@ func (pr *PacketRelay) handleListenAccept(fd int) {
 	conn, err := net.FileConn(file)
 	file.Close()
 	if err != nil {
+		unix.Close(nfd)
 		return
 	}
 
@@ -840,22 +957,8 @@ func (pr *PacketRelay) handleListenAccept(fd int) {
 	pr.logger.Info("REMOTE: Accepted connection from %s", remoteIP)
 }
 
-func macEqual(a, b net.HardwareAddr) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
 func htons(v uint16) uint16 {
-	b := make([]byte, 2)
-	binary.BigEndian.PutUint16(b, v)
-	return binary.LittleEndian.Uint16(b)
+	return (v >> 8) | (v << 8)
 }
 
 func interfaceIndex(name string) (int, error) {
@@ -868,18 +971,4 @@ func interfaceIndex(name string) (int, error) {
 
 func isENXIO(err error) bool {
 	return err == unix.ENXIO
-}
-
-// HexMAC returns a colon-separated hex MAC string from a hardware address.
-func HexMAC(mac net.HardwareAddr) string {
-	if len(mac) == 0 {
-		return "00:00:00:00:00:00"
-	}
-	return mac.String()
-}
-
-// ParseMACBytes parses a colon-separated MAC string to raw bytes.
-func ParseMACBytes(mac string) ([]byte, error) {
-	cleaned := strings.ReplaceAll(mac, ":", "")
-	return hex.DecodeString(cleaned)
 }
