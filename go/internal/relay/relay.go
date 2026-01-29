@@ -16,7 +16,6 @@ import (
 
 	"github.com/alsmith/multicast-relay/internal/cipher"
 	"github.com/alsmith/multicast-relay/internal/logger"
-	"github.com/alsmith/multicast-relay/internal/netifaces"
 
 	"golang.org/x/sys/unix"
 )
@@ -803,71 +802,113 @@ type InterfaceResult struct {
 	Broadcast string
 }
 
+// resolveInterface does a single pass over all system interfaces to find one
+// matching by name, IPv4 address, or CIDR block. This replaces the old
+// netifaces package which required up to 3 separate full enumerations.
+func resolveInterface(spec string) (*InterfaceResult, error) {
+	isCIDR := cidrRe.MatchString(spec)
+	isIP := !isCIDR && ipAddrRe.MatchString(spec)
+
+	var cidrNet *net.IPNet
+	if isCIDR {
+		var err error
+		_, cidrNet, err = net.ParseCIDR(spec)
+		if err != nil {
+			return nil, fmt.Errorf("invalid CIDR %s: %w", spec, err)
+		}
+	}
+
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, fmt.Errorf("listing interfaces: %w", err)
+	}
+
+	for _, iface := range ifaces {
+		// Name match: quick reject
+		nameMatch := (iface.Name == spec)
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ipnet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip4 := ipnet.IP.To4()
+			if ip4 == nil {
+				continue
+			}
+
+			matched := nameMatch
+			if !matched && isIP && ip4.String() == spec {
+				matched = true
+			}
+			if !matched && isCIDR && cidrNet.Contains(ip4) {
+				matched = true
+			}
+			if !matched {
+				continue
+			}
+
+			mask := ipnet.Mask
+			if len(mask) == 16 {
+				mask = mask[12:]
+			}
+			ipInt := binary.BigEndian.Uint32(ip4)
+			maskInt := binary.BigEndian.Uint32(mask)
+			bcastInt := ipInt | ^maskInt
+			bcast := make(net.IP, 4)
+			binary.BigEndian.PutUint32(bcast, bcastInt)
+
+			return &InterfaceResult{
+				Name:      iface.Name,
+				MAC:       iface.HardwareAddr,
+				IP:        ip4.String(),
+				Netmask:   fmt.Sprintf("%d.%d.%d.%d", mask[0], mask[1], mask[2], mask[3]),
+				Broadcast: bcast.String(),
+			}, nil
+		}
+	}
+
+	return nil, fmt.Errorf("interface %s not found", spec)
+}
+
 func (pr *PacketRelay) getInterface(iface string) (*InterfaceResult, error) {
-	var info *netifaces.InterfaceInfo
-	var err error
-
-	// Try as interface name
-	info, err = netifaces.FindByName(iface)
-
-	// Try as IP address
+	result, err := resolveInterface(iface)
 	if err != nil {
-		if ipAddrRe.MatchString(iface) {
-			info, err = netifaces.FindByIP(iface)
-		}
-	}
-
-	// Try as CIDR
-	if err != nil {
-		if cidrRe.MatchString(iface) {
-			info, err = netifaces.FindByCIDR(iface)
-		}
-	}
-
-	if err != nil {
-		return nil, fmt.Errorf("interface %s does not exist: %w", iface, err)
+		return nil, err
 	}
 
 	// Wait for IPv4 address if configured
-	if pr.wait {
-		for info.IP == nil {
-			pr.logger.Info("Waiting for IPv4 address on %s", info.Name)
+	if pr.wait && result.IP == "" {
+		for {
+			pr.logger.Info("Waiting for IPv4 address on %s", result.Name)
 			time.Sleep(time.Second)
-			info, err = netifaces.FindByName(info.Name)
+			result, err = resolveInterface(result.Name)
 			if err != nil {
 				return nil, err
+			}
+			if result.IP != "" {
+				break
 			}
 		}
 	}
 
-	if info.IP == nil {
-		return nil, fmt.Errorf("interface %s does not have an IPv4 address assigned", info.Name)
+	if result.IP == "" {
+		return nil, fmt.Errorf("interface %s does not have an IPv4 address assigned", iface)
 	}
 
-	var mac net.HardwareAddr
-	if len(info.MAC) > 0 {
-		mac = info.MAC
-	} else if pr.allowNonEther {
-		mac = net.HardwareAddr{0, 0, 0, 0, 0, 0}
-	} else {
-		return nil, fmt.Errorf("unable to detect MAC address for interface %s", info.Name)
+	if len(result.MAC) == 0 {
+		if pr.allowNonEther {
+			result.MAC = net.HardwareAddr{0, 0, 0, 0, 0, 0}
+		} else {
+			return nil, fmt.Errorf("unable to detect MAC address for interface %s", result.Name)
+		}
 	}
 
-	// Convert IPMask to dotted-quad notation
-	netmask := net.IP(info.Netmask).String()
-	if len(info.Netmask) == 4 {
-		netmask = fmt.Sprintf("%d.%d.%d.%d", info.Netmask[0], info.Netmask[1], info.Netmask[2], info.Netmask[3])
-	}
-
-	broadcast := info.Broadcast.String()
-
-	return &InterfaceResult{
-		Name:      info.Name,
-		MAC:       mac,
-		IP:        info.IP.String(),
-		Netmask:   netmask,
-		Broadcast: broadcast,
-	}, nil
+	return result, nil
 }
 
 func (pr *PacketRelay) remoteSockets() []net.Conn {
