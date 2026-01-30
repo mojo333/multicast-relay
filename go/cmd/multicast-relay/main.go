@@ -13,8 +13,8 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/alsmith/multicast-relay/internal/logger"
-	"github.com/alsmith/multicast-relay/internal/relay"
+	"github.com/mojo333/multicast-relay/internal/logger"
+	"github.com/mojo333/multicast-relay/internal/relay"
 )
 
 // stringSlice implements flag.Value for repeatable string flags.

@@ -14,8 +14,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/alsmith/multicast-relay/internal/cipher"
-	"github.com/alsmith/multicast-relay/internal/logger"
+	"github.com/mojo333/multicast-relay/internal/cipher"
+	"github.com/mojo333/multicast-relay/internal/logger"
 
 	"golang.org/x/sys/unix"
 )
