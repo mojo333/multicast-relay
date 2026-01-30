@@ -2,7 +2,7 @@
 //
 // Al Smith <ajs@aeschi.eu> January 2018
 // Go port 2026
-// https://github.com/alsmith/multicast-relay
+// https://github.com/mojo333/multicast-relay
 package main
 
 import (
