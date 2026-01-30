@@ -1,7 +1,5 @@
 // multicast-relay reimplemented in Go.
 //
-// Al Smith <ajs@aeschi.eu> January 2018
-// Go port 2026
 // https://github.com/mojo333/multicast-relay
 package main
 
