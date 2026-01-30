@@ -19,6 +19,7 @@ func parseARPTable(arpContent, ip string) string {
 	return ""
 }
 
+// readFile reads a file from disk and returns its contents.
 func readFile(path string) ([]byte, error) {
 	return os.ReadFile(path)
 }

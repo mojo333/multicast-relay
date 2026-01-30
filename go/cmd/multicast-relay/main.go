@@ -18,16 +18,21 @@ import (
 // stringSlice implements flag.Value for repeatable string flags.
 type stringSlice []string
 
+// String returns the flag value as a string.
 func (s *stringSlice) String() string { return strings.Join(*s, ", ") }
+
+// Set appends a value to the slice.
 func (s *stringSlice) Set(v string) error {
 	*s = append(*s, v)
 	return nil
 }
 
+// main is the program entry point.
 func main() {
 	os.Exit(run())
 }
 
+// run parses flags, configures the relay, and runs the event loop.
 func run() int {
 	var interfaces stringSlice
 	var noTransmitInterfaces stringSlice

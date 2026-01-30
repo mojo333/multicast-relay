@@ -470,6 +470,7 @@ func (pr *PacketRelay) Loop() error {
 	}
 }
 
+// processPacket processes an incoming packet and relays it to other interfaces.
 func (pr *PacketRelay) processPacket(data []byte, senderAddr string, receivingInterface string, ssdpSrc *ssdpSearchSource) {
 	if len(data) < 28 { // min IP header + UDP header
 		return
@@ -731,6 +732,7 @@ func (pr *PacketRelay) recoverTransmitter(tx *Transmitter, destMac net.HardwareA
 	}
 }
 
+// transmitPacket builds ethernet frames and sends a packet via a transmitter socket.
 func (pr *PacketRelay) transmitPacket(tx *Transmitter, destMac net.HardwareAddr, ipHeaderLength int, data []byte) error {
 	ipHeader := data[:ipHeaderLength]
 	udpHeader := data[ipHeaderLength : ipHeaderLength+8]
@@ -875,6 +877,7 @@ func resolveInterface(spec string) (*InterfaceResult, error) {
 	return nil, fmt.Errorf("interface %s not found", spec)
 }
 
+// getInterface resolves an interface spec and optionally waits for an IPv4 address.
 func (pr *PacketRelay) getInterface(iface string) (*InterfaceResult, error) {
 	result, err := resolveInterface(iface)
 	if err != nil {
@@ -911,6 +914,7 @@ func (pr *PacketRelay) getInterface(iface string) (*InterfaceResult, error) {
 	return result, nil
 }
 
+// remoteSockets collects all active remote relay connections.
 func (pr *PacketRelay) remoteSockets() []net.Conn {
 	var conns []net.Conn
 	conns = append(conns, pr.remoteConnections...)
@@ -922,6 +926,7 @@ func (pr *PacketRelay) remoteSockets() []net.Conn {
 	return conns
 }
 
+// connectRemotes establishes TCP connections to configured remote relays.
 func (pr *PacketRelay) connectRemotes() {
 	for _, remote := range pr.remoteAddrs {
 		if remote.Conn != nil {
@@ -945,6 +950,7 @@ func (pr *PacketRelay) connectRemotes() {
 	}
 }
 
+// removeConnection removes a remote connection from the active set.
 func (pr *PacketRelay) removeConnection(conn net.Conn) {
 	for i, c := range pr.remoteConnections {
 		if c == conn {
@@ -961,6 +967,7 @@ func (pr *PacketRelay) removeConnection(conn net.Conn) {
 	}
 }
 
+// handleListenAccept accepts incoming TCP connections from allowed remote relays.
 func (pr *PacketRelay) handleListenAccept(fd int) {
 	nfd, sa, err := unix.Accept(fd)
 	if err != nil {
@@ -998,10 +1005,12 @@ func (pr *PacketRelay) handleListenAccept(fd int) {
 	pr.logger.Info("REMOTE: Accepted connection from %s", remoteIP)
 }
 
+// htons converts a uint16 from host to network byte order.
 func htons(v uint16) uint16 {
 	return (v >> 8) | (v << 8)
 }
 
+// interfaceIndex returns the OS interface index for a named interface.
 func interfaceIndex(name string) (int, error) {
 	iface, err := net.InterfaceByName(name)
 	if err != nil {
@@ -1010,6 +1019,7 @@ func interfaceIndex(name string) (int, error) {
 	return iface.Index, nil
 }
 
+// isENXIO checks if an error is the ENXIO errno.
 func isENXIO(err error) bool {
 	return err == unix.ENXIO
 }
