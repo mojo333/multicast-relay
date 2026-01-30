@@ -1,7 +1,9 @@
 package relay
 
 import (
+	"bytes"
 	"encoding/binary"
+	"net"
 	"testing"
 )
 
@@ -375,4 +377,303 @@ func TestIP2LongRoundTrip(t *testing.T) {
 			t.Errorf("round-trip failed for %s: got %s", ip, got)
 		}
 	}
+}
+
+func TestLong2IP(t *testing.T) {
+	tests := []struct {
+		input    uint32
+		expected string
+	}{
+		{0x00000000, "0.0.0.0"},
+		{0xc0a80101, "192.168.1.1"},
+		{0xffffffff, "255.255.255.255"},
+		{0x0a000001, "10.0.0.1"},
+		{0xac100001, "172.16.0.1"},
+		{0x7f000001, "127.0.0.1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.expected, func(t *testing.T) {
+			got := Long2IP(tt.input)
+			if got != tt.expected {
+				t.Errorf("Long2IP(0x%08x) = %s, want %s", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestBroadcastIPToMAC(t *testing.T) {
+	mac := BroadcastIPToMAC()
+	expected := net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
+	if !bytes.Equal(mac, expected) {
+		t.Errorf("BroadcastIPToMAC() = %v, want %v", mac, expected)
+	}
+}
+
+func TestComputeIPChecksum(t *testing.T) {
+	// DNS query packet (full IP+UDP+payload)
+	dnsQuery := []byte{
+		0x45, 0x00, 0x00, 0x54, 0x33, 0x91, 0x40, 0x00, 0x40, 0x11, 0x84, 0x93,
+		0xc0, 0xa8, 0x00, 0x26, 0xc0, 0xa8, 0x00, 0xfe,
+		0xdf, 0xdd, 0x00, 0x35, 0x00, 0x40, 0xfe, 0x24,
+		0x72, 0xb7, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x01, 0x09, 0x67, 0x6f, 0x6f,
+		0x67, 0x6c, 0x65, 0x61, 0x64, 0x73, 0x01, 0x67,
+		0x0b, 0x64, 0x6f, 0x75, 0x62, 0x6c, 0x65, 0x63,
+		0x6c, 0x69, 0x63, 0x6b, 0x03, 0x6e, 0x65, 0x74,
+		0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x29,
+		0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	}
+
+	t.Run("recompute from zeroed checksum", func(t *testing.T) {
+		corrupted := make([]byte, len(dnsQuery))
+		copy(corrupted, dnsQuery)
+		corrupted[10] = 0x00
+		corrupted[11] = 0x00
+
+		result := ComputeIPChecksum(corrupted, 20)
+		gotChecksum := binary.BigEndian.Uint16(result[10:12])
+		if gotChecksum != 0x8493 {
+			t.Errorf("ComputeIPChecksum checksum = 0x%04x, want 0x8493", gotChecksum)
+		}
+	})
+
+	t.Run("recompute preserves correct checksum", func(t *testing.T) {
+		result := ComputeIPChecksum(dnsQuery, 20)
+		gotChecksum := binary.BigEndian.Uint16(result[10:12])
+		if gotChecksum != 0x8493 {
+			t.Errorf("ComputeIPChecksum checksum = 0x%04x, want 0x8493", gotChecksum)
+		}
+	})
+
+	t.Run("does not modify original", func(t *testing.T) {
+		original := make([]byte, len(dnsQuery))
+		copy(original, dnsQuery)
+		ComputeIPChecksum(dnsQuery, 20)
+		if !bytes.Equal(dnsQuery, original) {
+			t.Error("ComputeIPChecksum modified the input slice")
+		}
+	})
+
+	t.Run("IGMPv2 multicast with options", func(t *testing.T) {
+		// IP header with IHL=6 (24 bytes, has options)
+		igmp := []byte{
+			0x46, 0xc0, 0x00, 0x20, 0xe2, 0x92, 0x00, 0x00,
+			0x01, 0x02, 0x9f, 0xda, 0xc0, 0xa8, 0x01, 0x01,
+			0xe0, 0x00, 0x00, 0x01, 0x94, 0x04, 0x00, 0x00,
+		}
+		result := ComputeIPChecksum(igmp, 24)
+		gotChecksum := binary.BigEndian.Uint16(result[10:12])
+		if gotChecksum != 0x9fda {
+			t.Errorf("ComputeIPChecksum checksum = 0x%04x, want 0x9fda", gotChecksum)
+		}
+	})
+}
+
+func TestComputeUDPChecksum(t *testing.T) {
+	// DNS query packet
+	dnsQuery := []byte{
+		0x45, 0x00, 0x00, 0x54, 0x33, 0x91, 0x40, 0x00, 0x40, 0x11, 0x84, 0x93,
+		0xc0, 0xa8, 0x00, 0x26, 0xc0, 0xa8, 0x00, 0xfe,
+		0xdf, 0xdd, 0x00, 0x35, 0x00, 0x40, 0xfe, 0x24,
+		0x72, 0xb7, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x01, 0x09, 0x67, 0x6f, 0x6f,
+		0x67, 0x6c, 0x65, 0x61, 0x64, 0x73, 0x01, 0x67,
+		0x0b, 0x64, 0x6f, 0x75, 0x62, 0x6c, 0x65, 0x63,
+		0x6c, 0x69, 0x63, 0x6b, 0x03, 0x6e, 0x65, 0x74,
+		0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x29,
+		0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	}
+
+	t.Run("DNS query", func(t *testing.T) {
+		ipHeader := dnsQuery[:20]
+		udpHeader := dnsQuery[20:28]
+		data := dnsQuery[28:]
+
+		result := ComputeUDPChecksum(ipHeader, udpHeader, data)
+		if len(result) != 8 {
+			t.Fatalf("result length = %d, want 8", len(result))
+		}
+		// Src port, dst port, and length should be preserved
+		if !bytes.Equal(result[:6], udpHeader[:6]) {
+			t.Errorf("first 6 bytes changed: got %v, want %v", result[:6], udpHeader[:6])
+		}
+		gotChecksum := binary.BigEndian.Uint16(result[6:8])
+		if gotChecksum != 0xfe24 {
+			t.Errorf("UDP checksum = 0x%04x, want 0xfe24", gotChecksum)
+		}
+	})
+
+	// SSDP query packet
+	ssdpQuery := []byte{
+		0x45, 0x00, 0x00, 0x99, 0x4a, 0x5f, 0x40, 0x00, 0x01, 0x11, 0x7c, 0xe2,
+		0xc0, 0xa8, 0x01, 0x70, 0xef, 0xff, 0xff, 0xfa,
+		0xd9, 0x79, 0x07, 0x6c, 0x00, 0x85, 0x3e, 0x62,
+		0x4d, 0x2d, 0x53, 0x45, 0x41, 0x52, 0x43, 0x48,
+		0x20, 0x2a, 0x20, 0x48, 0x54, 0x54, 0x50, 0x2f,
+		0x31, 0x2e, 0x31, 0x0d, 0x0a, 0x48, 0x4f, 0x53,
+		0x54, 0x3a, 0x20, 0x32, 0x33, 0x39, 0x2e, 0x32,
+		0x35, 0x35, 0x2e, 0x32, 0x35, 0x35, 0x2e, 0x32,
+		0x35, 0x30, 0x3a, 0x31, 0x39, 0x30, 0x30, 0x0d,
+		0x0a, 0x4d, 0x41, 0x4e, 0x3a, 0x20, 0x22, 0x73,
+		0x73, 0x64, 0x70, 0x3a, 0x64, 0x69, 0x73, 0x63,
+		0x6f, 0x76, 0x65, 0x72, 0x22, 0x0d, 0x0a, 0x4d,
+		0x58, 0x3a, 0x20, 0x31, 0x0d, 0x0a, 0x53, 0x54,
+		0x3a, 0x20, 0x75, 0x72, 0x6e, 0x3a, 0x64, 0x69,
+		0x61, 0x6c, 0x2d, 0x6d, 0x75, 0x6c, 0x74, 0x69,
+		0x73, 0x63, 0x72, 0x65, 0x65, 0x6e, 0x2d, 0x6f,
+		0x72, 0x67, 0x3a, 0x73, 0x65, 0x72, 0x76, 0x69,
+		0x63, 0x65, 0x3a, 0x64, 0x69, 0x61, 0x6c, 0x3a,
+		0x31, 0x0d, 0x0a, 0x0d, 0x0a,
+	}
+
+	t.Run("SSDP query", func(t *testing.T) {
+		ipHeader := ssdpQuery[:20]
+		udpHeader := ssdpQuery[20:28]
+		data := ssdpQuery[28:]
+
+		result := ComputeUDPChecksum(ipHeader, udpHeader, data)
+		gotChecksum := binary.BigEndian.Uint16(result[6:8])
+		if gotChecksum != 0x3e62 {
+			t.Errorf("UDP checksum = 0x%04x, want 0x3e62", gotChecksum)
+		}
+	})
+}
+
+func TestMdnsSetUnicastBit(t *testing.T) {
+	// Helper to build an mDNS packet with the given DNS payload
+	buildPacket := func(dnsPayload []byte) []byte {
+		ipHeader := []byte{
+			0x45, 0x00, 0x00, 0x00, 0x12, 0x34, 0x00, 0x00,
+			0x01, 0x11, 0x00, 0x00, 0xc0, 0xa8, 0x01, 0x64,
+			0xe0, 0x00, 0x00, 0xfb,
+		}
+		udpLen := 8 + len(dnsPayload)
+		udpHeader := []byte{
+			0x14, 0xe9, 0x14, 0xe9,
+			byte(udpLen >> 8), byte(udpLen), 0x00, 0x00,
+		}
+		totalLen := 20 + udpLen
+		binary.BigEndian.PutUint16(ipHeader[2:4], uint16(totalLen))
+
+		pkt := make([]byte, 0, totalLen)
+		pkt = append(pkt, ipHeader...)
+		pkt = append(pkt, udpHeader...)
+		pkt = append(pkt, dnsPayload...)
+		return pkt
+	}
+
+	t.Run("single query sets unicast bit", func(t *testing.T) {
+		dns := []byte{
+			0x00, 0x00, // Transaction ID
+			0x00, 0x00, // Flags (standard query)
+			0x00, 0x01, // Questions: 1
+			0x00, 0x00, // Answer RRs
+			0x00, 0x00, // Authority RRs
+			0x00, 0x00, // Additional RRs
+			// Query: _http._tcp.local
+			0x05, '_', 'h', 't', 't', 'p',
+			0x04, '_', 't', 'c', 'p',
+			0x05, 'l', 'o', 'c', 'a', 'l',
+			0x00,       // null terminator
+			0x00, 0x0c, // Type: PTR
+			0x00, 0x01, // Class: IN (no unicast bit)
+		}
+		pkt := buildPacket(dns)
+		result := MdnsSetUnicastBit(pkt, 20)
+
+		// The class field is at DNS offset 32-33 (after 12-byte header + 18-byte name + 2-byte type)
+		// In the full packet: offset 20 (IP) + 8 (UDP) + 32 = 60
+		classOffset := 20 + 8 + 12 + 18 + 2
+		classField := binary.BigEndian.Uint16(result[classOffset : classOffset+2])
+		if classField != 0x8001 {
+			t.Errorf("class field = 0x%04x, want 0x8001", classField)
+		}
+	})
+
+	t.Run("two queries both get unicast bit", func(t *testing.T) {
+		dns := []byte{
+			0x00, 0x00, // Transaction ID
+			0x00, 0x00, // Flags
+			0x00, 0x02, // Questions: 2
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			// Query 1: foo.local
+			0x03, 'f', 'o', 'o',
+			0x05, 'l', 'o', 'c', 'a', 'l',
+			0x00,       // null
+			0x00, 0x01, // Type: A
+			0x00, 0x01, // Class: IN
+			// Query 2: bar.local
+			0x03, 'b', 'a', 'r',
+			0x05, 'l', 'o', 'c', 'a', 'l',
+			0x00,       // null
+			0x00, 0x01, // Type: A
+			0x00, 0x01, // Class: IN
+		}
+		pkt := buildPacket(dns)
+		result := MdnsSetUnicastBit(pkt, 20)
+
+		base := 20 + 8 // start of DNS payload
+		// Query 1 class: offset 12 (header) + 11 (name) + 2 (type) = 25 from DNS start
+		class1 := binary.BigEndian.Uint16(result[base+25 : base+27])
+		if class1 != 0x8001 {
+			t.Errorf("query 1 class = 0x%04x, want 0x8001", class1)
+		}
+		// Query 2 class: 25 + 4 (type+class of q1) + 1 padding? No...
+		// Query 2 starts at DNS offset 27 (12 + 15 for q1)
+		// Query 2 name: 11 bytes, type: 2 bytes, then class at offset 27+11+2 = 40
+		class2 := binary.BigEndian.Uint16(result[base+40 : base+42])
+		if class2 != 0x8001 {
+			t.Errorf("query 2 class = 0x%04x, want 0x8001", class2)
+		}
+	})
+
+	t.Run("response packet unchanged", func(t *testing.T) {
+		dns := []byte{
+			0x00, 0x00, // Transaction ID
+			0x84, 0x00, // Flags: QR=1 (response), AA=1
+			0x00, 0x01, // Questions: 1
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			// Query: foo.local
+			0x03, 'f', 'o', 'o',
+			0x05, 'l', 'o', 'c', 'a', 'l',
+			0x00,
+			0x00, 0x01, // Type: A
+			0x00, 0x01, // Class: IN (without unicast bit)
+		}
+		pkt := buildPacket(dns)
+		result := MdnsSetUnicastBit(pkt, 20)
+
+		// Class should remain 0x0001 because QR bit is set
+		base := 20 + 8
+		classField := binary.BigEndian.Uint16(result[base+25 : base+27])
+		if classField != 0x0001 {
+			t.Errorf("class field = 0x%04x, want 0x0001 (unchanged for response)", classField)
+		}
+	})
+
+	t.Run("already has unicast bit", func(t *testing.T) {
+		dns := []byte{
+			0x00, 0x00,
+			0x00, 0x00, // Query flags
+			0x00, 0x01,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x03, 'f', 'o', 'o',
+			0x05, 'l', 'o', 'c', 'a', 'l',
+			0x00,
+			0x00, 0x01,
+			0x80, 0x01, // Class: IN with unicast bit already set
+		}
+		pkt := buildPacket(dns)
+		original := make([]byte, len(pkt))
+		copy(original, pkt)
+
+		result := MdnsSetUnicastBit(pkt, 20)
+
+		// Should still be 0x8001
+		base := 20 + 8
+		classField := binary.BigEndian.Uint16(result[base+25 : base+27])
+		if classField != 0x8001 {
+			t.Errorf("class field = 0x%04x, want 0x8001", classField)
+		}
+	})
 }
