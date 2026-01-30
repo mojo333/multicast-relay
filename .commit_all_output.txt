@@ -1,0 +1,19 @@
+=== BRANCH ===
+master
+\n=== STATUS ===
+## master...origin/master
+ D .gitignore
+ D 81b9768f.0
+ D DigiCertHighAssuranceEVRootCA.crt
+ D README-OpenWRT.md
+ D README-ZeroShell.md
+ D ifFilter.json
+ D multicast-relay.py
+ D openwrt-python-encodings/__init__.py
+ D openwrt-python-encodings/aliases.py
+ D openwrt-python-encodings/ascii.py
+ D ssdpDiscover.py
+ D start.sh
+ D test_PacketRelay.py
+?? .commit_all_output.txt
+\n=== ADD ===
