@@ -1,6 +1,9 @@
 Relay broadcast and multicast packets between interfaces
 --------------------------------------------------------
 
+This is a port to Go of Al Smith's brilliant multicast-relay
+implementation originally written in Python.
+
 Useful, for example, if you have Sonos speakers on one interface, or VLAN,
 and you want to be able to control them from devices on a different
 interface/VLAN. Similar for Chromecast devices.
