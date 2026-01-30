@@ -35,9 +35,10 @@ jobs:
       - name: Build
         env:
           CGO_ENABLED: 0
+        working-directory: go
         run: |
-          mkdir -p bin
-          GOOS=linux GOARCH=${{ matrix.arch }} CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/multicast-relay-linux-${{ matrix.arch }} ./go/cmd/multicast-relay
+          mkdir -p ../bin
+          GOOS=linux GOARCH=${{ matrix.arch }} CGO_ENABLED=0 go build -ldflags="-s -w" -o ../bin/multicast-relay-linux-${{ matrix.arch }} ./cmd/multicast-relay
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
