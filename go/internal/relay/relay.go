@@ -7,9 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,17 +33,48 @@ const (
 
 	udpMaxLength       = 1458
 	maxRecentChecksums = 256
+
+	// ethPAllBE is ETH_P_ALL in network byte order (big-endian).
+	ethPAllBE = (unix.ETH_P_ALL>>8)&0xff | (unix.ETH_P_ALL&0xff)<<8
+)
+
+const (
+	// maxPacketSize is the maximum expected packet size for pooled buffers.
+	maxPacketSize = 10240
 )
 
 var (
 	magicBytes = [4]byte{'M', 'R', 'L', 'Y'}
 	zeroMAC    = net.HardwareAddr{0, 0, 0, 0, 0, 0}
 
-	// Pre-compiled regexes for hot paths.
 	ssdpSearchRe = regexp.MustCompile(`M-SEARCH|NOTIFY`)
-	ipAddrRe     = regexp.MustCompile(`^\d+\.\d+\.\d+\.\d+$`)
-	cidrRe       = regexp.MustCompile(`^\d+\.\d+\.\d+\.\d+/\d+$`)
+
+	// packetPool provides reusable byte buffers for packet processing.
+	packetPool = sync.Pool{
+		New: func() interface{} {
+			b := make([]byte, 0, maxPacketSize)
+			return &b
+		},
+	}
 )
+
+// getBuffer retrieves a buffer from the pool and sets its length to n.
+func getBuffer(n int) *[]byte {
+	bp := packetPool.Get().(*[]byte)
+	b := *bp
+	if cap(b) < n {
+		b = make([]byte, n, n*2)
+	} else {
+		b = b[:n]
+	}
+	*bp = b
+	return bp
+}
+
+// putBuffer returns a buffer to the pool.
+func putBuffer(bp *[]byte) {
+	packetPool.Put(bp)
+}
 
 // ssdpSearchSource tracks the most recent SSDP search source for unicast reply routing.
 type ssdpSearchSource struct {
@@ -54,9 +85,8 @@ type ssdpSearchSource struct {
 
 // parsedFilter is a pre-parsed ifFilter entry.
 type parsedFilter struct {
-	network string
-	netmask string
-	ifaces  []string
+	prefix netip.Prefix
+	ifaces []string
 }
 
 // RelayAddr stores a multicast/broadcast address and port pair.
@@ -132,13 +162,14 @@ type PacketRelay struct {
 	etherType    [2]byte
 
 	// Ring buffer for duplicate detection.
+	// Only accessed from the single-threaded main loop (Loop -> processPacket).
 	recentChecksums [maxRecentChecksums]uint16
 	checksumIdx     int
 	checksumCount   int
-	mu              sync.Mutex
 
 	listenAddr        []string
-	listenFd          int
+	listener          *net.TCPListener
+	acceptCh          chan net.Conn
 	remoteAddrs       []*RemoteAddr
 	remotePort        int
 	remoteRetry       int
@@ -147,8 +178,7 @@ type PacketRelay struct {
 	remoteConnections []net.Conn
 
 	// Pre-allocated poll structures rebuilt when receivers change.
-	pollFds []unix.PollFd
-	fdRoles []string // parallel to pollFds: "listen" or "receiver"
+	pollFds   []unix.PollFd
 	pollDirty bool
 }
 
@@ -175,9 +205,8 @@ func New(cfg Config) (*PacketRelay, error) {
 		masquerade:           masq,
 		logger:               cfg.Logger,
 		etherAddrs:           make(map[string]net.HardwareAddr),
-		etherType:            [2]byte{0x08, 0x00}, // IPv4
-		listenFd:             -1,
-		listenAddr:           cfg.Listen,
+		etherType:  [2]byte{0x08, 0x00}, // IPv4
+		listenAddr: cfg.Listen,
 		remotePort:           cfg.RemotePort,
 		remoteRetry:          cfg.RemoteRetry,
 		noRemoteRelay:        cfg.NoRemoteRelay,
@@ -201,25 +230,14 @@ func New(cfg Config) (*PacketRelay, error) {
 
 	// Set up listen socket if in server mode
 	if len(cfg.Listen) > 0 {
-		fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
+		laddr := &net.TCPAddr{Port: pr.remotePort}
+		ln, err := net.ListenTCP("tcp4", laddr)
 		if err != nil {
-			return nil, fmt.Errorf("cannot create listen socket: %w", err)
+			return nil, fmt.Errorf("cannot listen on port %d: %w", pr.remotePort, err)
 		}
-		if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
-			unix.Close(fd)
-			return nil, fmt.Errorf("cannot set SO_REUSEADDR: %w", err)
-		}
-
-		sa := &unix.SockaddrInet4{Port: pr.remotePort}
-		if err := unix.Bind(fd, sa); err != nil {
-			unix.Close(fd)
-			return nil, fmt.Errorf("cannot bind listen socket: %w", err)
-		}
-		if err := unix.Listen(fd, 5); err != nil {
-			unix.Close(fd)
-			return nil, fmt.Errorf("cannot listen: %w", err)
-		}
-		pr.listenFd = fd
+		pr.listener = ln
+		pr.acceptCh = make(chan net.Conn, 8)
+		go pr.acceptLoop()
 	} else if len(pr.remoteAddrs) > 0 {
 		pr.connectRemotes()
 	}
@@ -227,7 +245,7 @@ func New(cfg Config) (*PacketRelay, error) {
 	return pr, nil
 }
 
-// parseIfFilterFile reads and pre-parses the ifFilter JSON file into network/netmask pairs.
+// parseIfFilterFile reads and pre-parses the ifFilter JSON file into netip.Prefix entries.
 func parseIfFilterFile(path string) ([]parsedFilter, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -239,20 +257,17 @@ func parseIfFilterFile(path string) ([]parsedFilter, error) {
 	}
 	var filters []parsedFilter
 	for netStr, ifaces := range raw {
-		parts := strings.SplitN(netStr, "/", 2)
-		network := parts[0]
-		bits := 32
-		if len(parts) == 2 {
-			b, err := strconv.Atoi(parts[1])
-			if err != nil {
-				return nil, fmt.Errorf("invalid CIDR bits in ifFilter key %q: %w", netStr, err)
-			}
-			bits = b
+		// If no CIDR suffix, default to /32
+		if !strings.Contains(netStr, "/") {
+			netStr += "/32"
+		}
+		prefix, err := netip.ParsePrefix(netStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid CIDR in ifFilter key %q: %w", netStr, err)
 		}
 		filters = append(filters, parsedFilter{
-			network: network,
-			netmask: CIDRToNetmask(bits),
-			ifaces:  ifaces,
+			prefix: prefix,
+			ifaces: ifaces,
 		})
 	}
 	return filters, nil
@@ -324,7 +339,7 @@ func (pr *PacketRelay) AddListener(addr string, port int, service string) error 
 
 		// Create transmitter for this interface (unless in noTransmitInterfaces)
 		if !pr.noTransmitInterfaces[iface] {
-			txFd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_ALL)))
+			txFd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, ethPAllBE)
 			if err != nil {
 				return fmt.Errorf("cannot create transmit socket for %s: %w", ifInfo.Name, err)
 			}
@@ -336,7 +351,7 @@ func (pr *PacketRelay) AddListener(addr string, port int, service string) error 
 			}
 
 			sa := &unix.SockaddrLinklayer{
-				Protocol: htons(unix.ETH_P_ALL),
+				Protocol: uint16(ethPAllBE),
 				Ifindex:  ifIndex,
 			}
 			if err := unix.Bind(txFd, sa); err != nil {
@@ -379,22 +394,10 @@ func (pr *PacketRelay) AddListener(addr string, port int, service string) error 
 
 // rebuildPollFds rebuilds the pre-allocated poll fd set.
 func (pr *PacketRelay) rebuildPollFds() {
-	count := len(pr.receivers)
-	if pr.listenFd >= 0 {
-		count++
-	}
-
-	pr.pollFds = make([]unix.PollFd, 0, count)
-	pr.fdRoles = make([]string, 0, count)
-
-	if pr.listenFd >= 0 {
-		pr.pollFds = append(pr.pollFds, unix.PollFd{Fd: int32(pr.listenFd), Events: unix.POLLIN})
-		pr.fdRoles = append(pr.fdRoles, "listen")
-	}
+	pr.pollFds = make([]unix.PollFd, 0, len(pr.receivers))
 
 	for _, rx := range pr.receivers {
 		pr.pollFds = append(pr.pollFds, unix.PollFd{Fd: int32(rx.fd), Events: unix.POLLIN})
-		pr.fdRoles = append(pr.fdRoles, "receiver")
 	}
 
 	pr.pollDirty = false
@@ -420,6 +423,20 @@ func (pr *PacketRelay) Loop() error {
 			continue
 		}
 
+		// Drain accepted connections (non-blocking)
+		if pr.acceptCh != nil {
+		drainAccept:
+			for {
+				select {
+				case conn := <-pr.acceptCh:
+					pr.remoteConnections = append(pr.remoteConnections, conn)
+					pr.logger.Info("REMOTE: Accepted connection from %s", conn.RemoteAddr())
+				default:
+					break drainAccept
+				}
+			}
+		}
+
 		// Clear revents before polling
 		for i := range pr.pollFds {
 			pr.pollFds[i].Revents = 0
@@ -436,13 +453,8 @@ func (pr *PacketRelay) Loop() error {
 			continue
 		}
 
-		for i, pfd := range pr.pollFds {
+		for _, pfd := range pr.pollFds {
 			if pfd.Revents&unix.POLLIN == 0 {
-				continue
-			}
-
-			if pr.fdRoles[i] == "listen" {
-				pr.handleListenAccept(int(pfd.Fd))
 				continue
 			}
 
@@ -456,16 +468,18 @@ func (pr *PacketRelay) Loop() error {
 				continue
 			}
 
-			data := make([]byte, nread)
-			copy(data, buf[:nread])
+			dataBp := getBuffer(nread)
+			copy(*dataBp, buf[:nread])
 
 			sa, ok := from.(*unix.SockaddrInet4)
 			if !ok {
+				putBuffer(dataBp)
 				continue
 			}
-			senderAddr := net.IP(sa.Addr[:]).String()
+			senderAddr := AddrFrom4Bytes(sa.Addr[:]).String()
 
-			pr.processPacket(data, senderAddr, "local", &ssdpSrc)
+			pr.processPacket(*dataBp, senderAddr, "local", &ssdpSrc)
+			putBuffer(dataBp)
 		}
 	}
 }
@@ -514,8 +528,8 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr string, receivingIn
 		return
 	}
 
-	srcAddr := net.IP(data[12:16]).String()
-	dstAddr := net.IP(data[16:20]).String()
+	srcAddr := AddrFrom4Bytes(data[12:16]).String()
+	dstAddr := AddrFrom4Bytes(data[16:20]).String()
 
 	// IP header length
 	ipHeaderLength := int(data[0]&0x0f) * 4
@@ -615,7 +629,8 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr string, receivingIn
 				continue
 			}
 
-			txData := make([]byte, len(data))
+			txBp := getBuffer(len(data))
+			txData := *txBp
 			copy(txData, data)
 
 			isMasq := pr.masquerade[tx.Interface]
@@ -648,14 +663,14 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr string, receivingIn
 					pr.logger.Info("Error sending packet: %s", err)
 				}
 			}
+			putBuffer(txBp)
 		}
 	}
 }
 
 // isDuplicate checks whether this checksum was recently seen.
+// Not safe for concurrent use — only call from the main loop goroutine.
 func (pr *PacketRelay) isDuplicate(checksum uint16) bool {
-	pr.mu.Lock()
-	defer pr.mu.Unlock()
 	n := pr.checksumCount
 	if n > maxRecentChecksums {
 		n = maxRecentChecksums
@@ -669,20 +684,19 @@ func (pr *PacketRelay) isDuplicate(checksum uint16) bool {
 }
 
 // addChecksum records a checksum in the ring buffer.
+// Not safe for concurrent use — only call from the main loop goroutine.
 func (pr *PacketRelay) addChecksum(checksum uint16) {
-	pr.mu.Lock()
 	pr.recentChecksums[pr.checksumIdx] = checksum
 	pr.checksumIdx = (pr.checksumIdx + 1) % maxRecentChecksums
 	if pr.checksumCount < maxRecentChecksums {
 		pr.checksumCount++
 	}
-	pr.mu.Unlock()
 }
 
 // isAllowedByFilter checks the pre-parsed ifFilter rules.
 func (pr *PacketRelay) isAllowedByFilter(srcAddr, txInterface string) bool {
 	for _, f := range pr.parsedFilters {
-		if OnNetwork(srcAddr, f.network, f.netmask) {
+		if OnNetworkPrefix(srcAddr, f.prefix) {
 			for _, iface := range f.ifaces {
 				if iface == txInterface {
 					return true
@@ -702,7 +716,7 @@ func (pr *PacketRelay) recoverTransmitter(tx *Transmitter, destMac net.HardwareA
 		pr.logger.Info("Recovery failed for %s: %s", tx.Interface, err)
 		return
 	}
-	newFd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_ALL)))
+	newFd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, ethPAllBE)
 	if err != nil {
 		pr.logger.Info("Recovery socket creation failed for %s: %s", tx.Interface, err)
 		return
@@ -714,7 +728,7 @@ func (pr *PacketRelay) recoverTransmitter(tx *Transmitter, destMac net.HardwareA
 		return
 	}
 	sa := &unix.SockaddrLinklayer{
-		Protocol: htons(unix.ETH_P_ALL),
+		Protocol: uint16(ethPAllBE),
 		Ifindex:  ifIdx,
 	}
 	if err := unix.Bind(newFd, sa); err != nil {
@@ -733,6 +747,7 @@ func (pr *PacketRelay) recoverTransmitter(tx *Transmitter, destMac net.HardwareA
 }
 
 // transmitPacket builds ethernet frames and sends a packet via a transmitter socket.
+// Uses a pooled scratch buffer to avoid per-fragment heap allocations.
 func (pr *PacketRelay) transmitPacket(tx *Transmitter, destMac net.HardwareAddr, ipHeaderLength int, data []byte) error {
 	ipHeader := data[:ipHeaderLength]
 	udpHeader := data[ipHeaderLength : ipHeaderLength+8]
@@ -742,13 +757,21 @@ func (pr *PacketRelay) transmitPacket(tx *Transmitter, destMac net.HardwareAddr,
 
 	udpHeader = ComputeUDPChecksum(ipHeader, udpHeader, payload)
 
+	hasEther := !bytes.Equal(tx.MAC, zeroMAC)
+
+	// Get a scratch buffer large enough for the largest frame: 14 (ether) + full packet
+	maxFrameSize := 14 + len(data)
+	scratchBp := getBuffer(maxFrameSize)
+	defer putBuffer(scratchBp)
+	scratch := *scratchBp
+
 	for boundary := 0; boundary < len(payload); boundary += udpMaxLength {
 		end := boundary + udpMaxLength
 		if end > len(payload) {
 			end = len(payload)
 		}
 		dataFragment := payload[boundary:end]
-		totalLength := len(ipHeader) + len(udpHeader) + len(dataFragment)
+		totalLength := ipHeaderLength + 8 + len(dataFragment)
 		moreFragments := end < len(payload)
 
 		flagsOffset := uint16(boundary & 0x1fff)
@@ -758,36 +781,40 @@ func (pr *PacketRelay) transmitPacket(tx *Transmitter, destMac net.HardwareAddr,
 			flagsOffset |= 0x4000
 		}
 
-		// Update total length and flags/offset
-		fragIPHeader := make([]byte, len(ipHeader))
-		copy(fragIPHeader, ipHeader)
-		binary.BigEndian.PutUint16(fragIPHeader[2:4], uint16(totalLength))
-		binary.BigEndian.PutUint16(fragIPHeader[6:8], flagsOffset)
+		// Build the IP packet into the scratch buffer (after ether header space)
+		etherOff := 0
+		if hasEther {
+			etherOff = 14
+		}
 
-		ipPacket := make([]byte, 0, len(fragIPHeader)+len(udpHeader)+len(dataFragment))
-		ipPacket = append(ipPacket, fragIPHeader...)
-		ipPacket = append(ipPacket, udpHeader...)
-		ipPacket = append(ipPacket, dataFragment...)
+		// Copy IP header, modify total length and flags/offset
+		copy(scratch[etherOff:], ipHeader)
+		binary.BigEndian.PutUint16(scratch[etherOff+2:etherOff+4], uint16(totalLength))
+		binary.BigEndian.PutUint16(scratch[etherOff+6:etherOff+8], flagsOffset)
 
-		ipPacket = ComputeIPChecksum(ipPacket, ipHeaderLength)
+		// Append UDP header and data fragment
+		copy(scratch[etherOff+ipHeaderLength:], udpHeader)
+		copy(scratch[etherOff+ipHeaderLength+8:], dataFragment)
+
+		ipPacket := scratch[etherOff : etherOff+totalLength]
+		ComputeIPChecksum(ipPacket, ipHeaderLength)
 
 		// Track checksum for duplicate detection
 		cs := binary.BigEndian.Uint16(ipPacket[10:12])
 		pr.addChecksum(cs)
 
-		var packet []byte
-		if !bytes.Equal(tx.MAC, zeroMAC) {
+		var frame []byte
+		if hasEther {
 			// Prepend ethernet header: destMac + srcMac + etherType
-			packet = make([]byte, 0, 14+len(ipPacket))
-			packet = append(packet, destMac...)
-			packet = append(packet, tx.MAC...)
-			packet = append(packet, pr.etherType[:]...)
-			packet = append(packet, ipPacket...)
+			copy(scratch[0:6], destMac)
+			copy(scratch[6:12], tx.MAC)
+			copy(scratch[12:14], pr.etherType[:])
+			frame = scratch[:14+totalLength]
 		} else {
-			packet = ipPacket
+			frame = ipPacket
 		}
 
-		if err := unix.Send(tx.Socket, packet, 0); err != nil {
+		if err := unix.Send(tx.Socket, frame, 0); err != nil {
 			return err
 		}
 	}
@@ -808,17 +835,11 @@ type InterfaceResult struct {
 // matching by name, IPv4 address, or CIDR block. This replaces the old
 // netifaces package which required up to 3 separate full enumerations.
 func resolveInterface(spec string) (*InterfaceResult, error) {
-	isCIDR := cidrRe.MatchString(spec)
-	isIP := !isCIDR && ipAddrRe.MatchString(spec)
-
-	var cidrNet *net.IPNet
-	if isCIDR {
-		var err error
-		_, cidrNet, err = net.ParseCIDR(spec)
-		if err != nil {
-			return nil, fmt.Errorf("invalid CIDR %s: %w", spec, err)
-		}
-	}
+	// Determine if spec is a CIDR prefix, an IP address, or a name.
+	specPrefix, cidrErr := netip.ParsePrefix(spec)
+	specAddr, addrErr := netip.ParseAddr(spec)
+	isCIDR := cidrErr == nil
+	isIP := !isCIDR && addrErr == nil
 
 	ifaces, err := net.Interfaces()
 	if err != nil {
@@ -826,7 +847,6 @@ func resolveInterface(spec string) (*InterfaceResult, error) {
 	}
 
 	for _, iface := range ifaces {
-		// Name match: quick reject
 		nameMatch := (iface.Name == spec)
 
 		addrs, err := iface.Addrs()
@@ -843,11 +863,13 @@ func resolveInterface(spec string) (*InterfaceResult, error) {
 				continue
 			}
 
+			ifAddr := AddrFrom4Bytes(ip4)
+
 			matched := nameMatch
-			if !matched && isIP && ip4.String() == spec {
+			if !matched && isIP && ifAddr == specAddr {
 				matched = true
 			}
-			if !matched && isCIDR && cidrNet.Contains(ip4) {
+			if !matched && isCIDR && specPrefix.Contains(ifAddr) {
 				matched = true
 			}
 			if !matched {
@@ -861,15 +883,15 @@ func resolveInterface(spec string) (*InterfaceResult, error) {
 			ipInt := binary.BigEndian.Uint32(ip4)
 			maskInt := binary.BigEndian.Uint32(mask)
 			bcastInt := ipInt | ^maskInt
-			bcast := make(net.IP, 4)
-			binary.BigEndian.PutUint32(bcast, bcastInt)
+			var bcastBytes [4]byte
+			binary.BigEndian.PutUint32(bcastBytes[:], bcastInt)
 
 			return &InterfaceResult{
 				Name:      iface.Name,
 				MAC:       iface.HardwareAddr,
-				IP:        ip4.String(),
+				IP:        ifAddr.String(),
 				Netmask:   fmt.Sprintf("%d.%d.%d.%d", mask[0], mask[1], mask[2], mask[3]),
-				Broadcast: bcast.String(),
+				Broadcast: netip.AddrFrom4(bcastBytes).String(),
 			}, nil
 		}
 	}
@@ -967,47 +989,36 @@ func (pr *PacketRelay) removeConnection(conn net.Conn) {
 	}
 }
 
-// handleListenAccept accepts incoming TCP connections from allowed remote relays.
-func (pr *PacketRelay) handleListenAccept(fd int) {
-	nfd, sa, err := unix.Accept(fd)
-	if err != nil {
-		return
-	}
-
-	var remoteIP string
-	if sa4, ok := sa.(*unix.SockaddrInet4); ok {
-		remoteIP = net.IP(sa4.Addr[:]).String()
-	}
-
-	allowed := false
+// acceptLoop runs in a dedicated goroutine, accepting TCP connections and sending
+// validated ones to acceptCh for the main loop to consume.
+func (pr *PacketRelay) acceptLoop() {
+	allowedSet := make(map[string]bool, len(pr.listenAddr))
 	for _, addr := range pr.listenAddr {
-		if addr == remoteIP {
-			allowed = true
-			break
+		allowedSet[addr] = true
+	}
+
+	for {
+		conn, err := pr.listener.Accept()
+		if err != nil {
+			// Listener was closed; exit goroutine.
+			return
 		}
+
+		tcpAddr, ok := conn.RemoteAddr().(*net.TCPAddr)
+		if !ok {
+			conn.Close()
+			continue
+		}
+
+		remoteIP := tcpAddr.IP.String()
+		if !allowedSet[remoteIP] {
+			pr.logger.Info("Refusing connection from %s - not in allowed list", remoteIP)
+			conn.Close()
+			continue
+		}
+
+		pr.acceptCh <- conn
 	}
-
-	if !allowed {
-		pr.logger.Info("Refusing connection from %s - not in allowed list", remoteIP)
-		unix.Close(nfd)
-		return
-	}
-
-	file := os.NewFile(uintptr(nfd), "remote")
-	conn, err := net.FileConn(file)
-	file.Close()
-	if err != nil {
-		unix.Close(nfd)
-		return
-	}
-
-	pr.remoteConnections = append(pr.remoteConnections, conn)
-	pr.logger.Info("REMOTE: Accepted connection from %s", remoteIP)
-}
-
-// htons converts a uint16 from host to network byte order.
-func htons(v uint16) uint16 {
-	return (v >> 8) | (v << 8)
 }
 
 // interfaceIndex returns the OS interface index for a named interface.
