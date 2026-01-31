@@ -2,9 +2,9 @@ package relay
 
 import (
 	"encoding/json"
+	"net/netip"
 	"os"
 	"path/filepath"
-	"sync"
 	"testing"
 )
 
@@ -106,22 +106,21 @@ func TestDuplicateRingBufferOverflow(t *testing.T) {
 	}
 }
 
-func TestDuplicateDetectionConcurrent(t *testing.T) {
+func TestDuplicateDetectionSequentialStress(t *testing.T) {
+	// The ring buffer is intentionally not safe for concurrent use.
+	// It is only accessed from the single-threaded main loop.
+	// This test validates correctness under heavy sequential use.
 	pr := &PacketRelay{}
 
-	var wg sync.WaitGroup
 	for g := 0; g < 10; g++ {
-		wg.Add(1)
-		go func(base uint16) {
-			defer wg.Done()
-			for i := uint16(0); i < 100; i++ {
-				pr.addChecksum(base + i)
-				pr.isDuplicate(base + i)
+		base := uint16(g) * 100
+		for i := uint16(0); i < 100; i++ {
+			pr.addChecksum(base + i)
+			if !pr.isDuplicate(base + i) {
+				t.Errorf("expected %d to be duplicate after adding", base+i)
 			}
-		}(uint16(g) * 100)
+		}
 	}
-	wg.Wait()
-	// No data race = pass (run with -race flag)
 }
 
 // --- Interface filter tests ---
@@ -141,14 +140,12 @@ func TestIsAllowedByFilter(t *testing.T) {
 	pr := &PacketRelay{
 		parsedFilters: []parsedFilter{
 			{
-				network: "192.168.1.0",
-				netmask: "255.255.255.0",
-				ifaces:  []string{"eth0", "eth1"},
+				prefix: netip.MustParsePrefix("192.168.1.0/24"),
+				ifaces: []string{"eth0", "eth1"},
 			},
 			{
-				network: "10.0.0.0",
-				netmask: "255.0.0.0",
-				ifaces:  []string{"wlan0"},
+				prefix: netip.MustParsePrefix("10.0.0.0/8"),
+				ifaces: []string{"wlan0"},
 			},
 		},
 	}
@@ -202,13 +199,13 @@ func TestParseIfFilterFile(t *testing.T) {
 		found24 := false
 		found8 := false
 		for _, f := range filters {
-			if f.network == "192.168.1.0" && f.netmask == "255.255.255.0" {
+			if f.prefix == netip.MustParsePrefix("192.168.1.0/24") {
 				found24 = true
 				if len(f.ifaces) != 2 {
 					t.Errorf("expected 2 interfaces for /24 filter, got %d", len(f.ifaces))
 				}
 			}
-			if f.network == "10.0.0.0" && f.netmask == "255.0.0.0" {
+			if f.prefix == netip.MustParsePrefix("10.0.0.0/8") {
 				found8 = true
 				if len(f.ifaces) != 1 {
 					t.Errorf("expected 1 interface for /8 filter, got %d", len(f.ifaces))
@@ -239,8 +236,9 @@ func TestParseIfFilterFile(t *testing.T) {
 		if len(filters) != 1 {
 			t.Fatalf("expected 1 filter, got %d", len(filters))
 		}
-		if filters[0].netmask != "255.255.255.255" {
-			t.Errorf("expected /32 netmask, got %s", filters[0].netmask)
+		expected := netip.MustParsePrefix("192.168.1.1/32")
+		if filters[0].prefix != expected {
+			t.Errorf("expected %s prefix, got %s", expected, filters[0].prefix)
 		}
 	})
 

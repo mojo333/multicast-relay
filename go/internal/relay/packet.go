@@ -3,6 +3,14 @@ package relay
 import (
 	"encoding/binary"
 	"net"
+	"net/netip"
+)
+
+// Pre-parsed multicast range boundaries for fast comparison.
+var (
+	multicastMin = netip.MustParseAddr("224.0.0.0")
+	multicastMax = netip.MustParseAddr("239.255.255.255")
+	broadcastIP  = netip.MustParseAddr("255.255.255.255")
 )
 
 // NetChecksum computes the one's complement checksum over data, used for IP and UDP checksums.
@@ -21,42 +29,48 @@ func NetChecksum(data []byte) uint16 {
 	return ^uint16(sum)
 }
 
-// ComputeIPChecksum zeros out the existing checksum field and recomputes the IP header checksum.
-// Returns the updated packet with the new checksum in bytes 10-11.
-func ComputeIPChecksum(data []byte, ipHeaderLength int) []byte {
-	// Zero out existing checksum
-	result := make([]byte, len(data))
-	copy(result, data)
-	result[10] = 0
-	result[11] = 0
+// checksumAdd accumulates a running one's complement sum over data.
+func checksumAdd(sum uint32, data []byte) uint32 {
+	length := len(data)
+	for i := 0; i+1 < length; i += 2 {
+		sum += uint32(binary.BigEndian.Uint16(data[i : i+2]))
+	}
+	if length%2 != 0 {
+		sum += uint32(data[length-1]) << 8
+	}
+	return sum
+}
 
-	checksum := NetChecksum(result[:ipHeaderLength])
-	binary.BigEndian.PutUint16(result[10:12], checksum)
-	return result
+// checksumFinalize folds a 32-bit sum into a 16-bit one's complement checksum.
+func checksumFinalize(sum uint32) uint16 {
+	for sum > 0xffff {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
+}
+
+// ComputeIPChecksum zeros out the existing checksum field and recomputes the IP header checksum.
+// Modifies data in place and returns the same slice.
+func ComputeIPChecksum(data []byte, ipHeaderLength int) []byte {
+	data[10] = 0
+	data[11] = 0
+	checksum := NetChecksum(data[:ipHeaderLength])
+	binary.BigEndian.PutUint16(data[10:12], checksum)
+	return data
 }
 
 // ComputeUDPChecksum computes the UDP checksum using the pseudo-header.
+// Computes incrementally across pseudo-header, UDP header, and data without concatenation.
 func ComputeUDPChecksum(ipHeader, udpHeader, data []byte) []byte {
-	// Pseudo IP header: src_ip(4) + dst_ip(4) + 0x00 + protocol(1) + udp_length(2)
-	pseudoHeader := make([]byte, 0, 12)
-	pseudoHeader = append(pseudoHeader, ipHeader[12:20]...) // src + dst IP
-	pseudoHeader = append(pseudoHeader, 0x00)               // zero
-	pseudoHeader = append(pseudoHeader, ipHeader[9])         // protocol
-	pseudoHeader = append(pseudoHeader, udpHeader[4:6]...)   // udp length
+	var sum uint32
+	sum = checksumAdd(sum, ipHeader[12:20])                // src + dst IP
+	sum += uint32(ipHeader[9])                             // protocol
+	sum += uint32(binary.BigEndian.Uint16(udpHeader[4:6])) // udp length
 
-	// Build the full packet for checksum: pseudo + udp header (with zeroed checksum) + data
-	packet := make([]byte, 0, len(pseudoHeader)+6+2+len(data))
-	packet = append(packet, pseudoHeader...)
-	packet = append(packet, udpHeader[:6]...) // src port, dst port, length
-	packet = append(packet, 0x00, 0x00)       // zeroed checksum
-	packet = append(packet, data...)
+	sum = checksumAdd(sum, udpHeader[:6]) // src port, dst port, length
+	sum = checksumAdd(sum, data)
 
-	// Pad to even length
-	if len(packet)%2 != 0 {
-		packet = append(packet, 0x00)
-	}
-
-	checksum := NetChecksum(packet)
+	checksum := checksumFinalize(sum)
 
 	result := make([]byte, 8)
 	copy(result, udpHeader[:6])
@@ -85,30 +99,26 @@ func ModifyUDPPacket(data []byte, ipHeaderLength int, newSrcAddr string, newSrcP
 		dstPort = newDstPort
 	}
 
-	// Rebuild IP header (everything before the last 8 bytes which are src+dst IP)
 	ipHeader := make([]byte, 0, ipHeaderLength)
 	ipHeader = append(ipHeader, data[:ipHeaderLength-8]...)
 	ipHeader = append(ipHeader, srcAddr...)
 	ipHeader = append(ipHeader, dstAddr...)
 
-	// Rebuild UDP header
 	udpData := data[ipHeaderLength+8:]
 	udpLength := uint16(8 + len(udpData))
 	udpHeader := make([]byte, 8)
 	binary.BigEndian.PutUint16(udpHeader[0:2], srcPort)
 	binary.BigEndian.PutUint16(udpHeader[2:4], dstPort)
 	binary.BigEndian.PutUint16(udpHeader[4:6], udpLength)
-	binary.BigEndian.PutUint16(udpHeader[6:8], 0) // checksum zeroed, recomputed later
+	binary.BigEndian.PutUint16(udpHeader[6:8], 0)
 
-	// Recompute IP checksum
 	fullPacket := make([]byte, 0, len(ipHeader)+len(udpHeader)+len(udpData))
 	fullPacket = append(fullPacket, ipHeader...)
 	fullPacket = append(fullPacket, udpHeader...)
 	fullPacket = append(fullPacket, udpData...)
 
-	fullPacket = ComputeIPChecksum(fullPacket, ipHeaderLength)
+	ComputeIPChecksum(fullPacket, ipHeaderLength)
 
-	// Recompute UDP checksum
 	newUDPHeader := ComputeUDPChecksum(fullPacket[:ipHeaderLength], fullPacket[ipHeaderLength:ipHeaderLength+8], udpData)
 
 	result := make([]byte, 0, len(fullPacket))
@@ -127,7 +137,6 @@ func MdnsSetUnicastBit(data []byte, ipHeaderLength int) []byte {
 
 	flags := binary.BigEndian.Uint16(udpData[2:4])
 	if flags&0x8000 != 0 {
-		// Already set
 		result := make([]byte, 0, len(data))
 		result = append(result, headers...)
 		result = append(result, udpData...)
@@ -169,11 +178,11 @@ func MdnsSetUnicastBit(data []byte, ipHeaderLength int) []byte {
 
 // IsMulticast returns true if the IP address is a multicast address (224.0.0.0 - 239.255.255.255).
 func IsMulticast(ip string) bool {
-	parsed := net.ParseIP(ip).To4()
-	if parsed == nil {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
 		return false
 	}
-	return parsed[0] >= 224 && parsed[0] <= 239
+	return addr.Compare(multicastMin) >= 0 && addr.Compare(multicastMax) <= 0
 }
 
 // IsBroadcast returns true if the IP is the broadcast address 255.255.255.255.
@@ -183,18 +192,12 @@ func IsBroadcast(ip string) bool {
 
 // MulticastIPToMAC derives the ethernet MAC from a multicast IP address per RFC 1112.
 func MulticastIPToMAC(ip string) net.HardwareAddr {
-	parsed := net.ParseIP(ip).To4()
-	if parsed == nil {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil || !addr.Is4() {
 		return nil
 	}
-	mac := make(net.HardwareAddr, 6)
-	mac[0] = 0x01
-	mac[1] = 0x00
-	mac[2] = 0x5e
-	mac[3] = parsed[1] & 0x7f
-	mac[4] = parsed[2]
-	mac[5] = parsed[3]
-	return mac
+	b := addr.As4()
+	return net.HardwareAddr{0x01, 0x00, 0x5e, b[1] & 0x7f, b[2], b[3]}
 }
 
 // BroadcastIPToMAC returns the broadcast ethernet MAC (ff:ff:ff:ff:ff:ff).
@@ -204,21 +207,22 @@ func BroadcastIPToMAC() net.HardwareAddr {
 
 // IP2Long converts a dotted-quad IP string to a uint32.
 func IP2Long(ip string) uint32 {
-	parsed := net.ParseIP(ip).To4()
-	if parsed == nil {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil || !addr.Is4() {
 		return 0
 	}
-	return binary.BigEndian.Uint32(parsed)
+	b := addr.As4()
+	return binary.BigEndian.Uint32(b[:])
 }
 
 // Long2IP converts a uint32 to a dotted-quad IP string.
 func Long2IP(ip uint32) string {
-	b := make([]byte, 4)
-	binary.BigEndian.PutUint32(b, ip)
-	return net.IP(b).String()
+	var b [4]byte
+	binary.BigEndian.PutUint32(b[:], ip)
+	return netip.AddrFrom4(b).String()
 }
 
-// OnNetwork checks if an IP is on the given network/netmask.
+// OnNetwork checks if an IP is on the given network/netmask (string-based API for backward compat).
 func OnNetwork(ip, network, netmask string) bool {
 	ipL := IP2Long(ip)
 	networkL := IP2Long(network)
@@ -226,10 +230,24 @@ func OnNetwork(ip, network, netmask string) bool {
 	return (ipL & netmaskL) == (networkL & netmaskL)
 }
 
+// OnNetworkPrefix checks if an IP address is within a netip.Prefix.
+func OnNetworkPrefix(ip string, prefix netip.Prefix) bool {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return false
+	}
+	return prefix.Contains(addr)
+}
+
 // CIDRToNetmask converts CIDR prefix bits to a dotted-quad netmask string.
 func CIDRToNetmask(bits int) string {
 	mask := uint32(0xffffffff) << (32 - bits) & 0xffffffff
 	return Long2IP(mask)
+}
+
+// AddrFrom4Bytes creates a netip.Addr from 4 raw bytes (no heap allocation).
+func AddrFrom4Bytes(b []byte) netip.Addr {
+	return netip.AddrFrom4([4]byte{b[0], b[1], b[2], b[3]})
 }
 
 // UnicastIPToMAC looks up a MAC address in the ARP table for a given IP.

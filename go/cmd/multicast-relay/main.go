@@ -1,8 +1,6 @@
 // multicast-relay reimplemented in Go.
 //
-// Al Smith <ajs@aeschi.eu> January 2018
-// Go port 2026
-// https://github.com/alsmith/multicast-relay
+// https://github.com/mojo333/multicast-relay
 package main
 
 import (
@@ -13,23 +11,28 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/alsmith/multicast-relay/internal/logger"
-	"github.com/alsmith/multicast-relay/internal/relay"
+	"github.com/mojo333/multicast-relay/internal/logger"
+	"github.com/mojo333/multicast-relay/internal/relay"
 )
 
 // stringSlice implements flag.Value for repeatable string flags.
 type stringSlice []string
 
+// String returns the flag value as a string.
 func (s *stringSlice) String() string { return strings.Join(*s, ", ") }
+
+// Set appends a value to the slice.
 func (s *stringSlice) Set(v string) error {
 	*s = append(*s, v)
 	return nil
 }
 
+// main is the program entry point.
 func main() {
 	os.Exit(run())
 }
 
+// run parses flags, configures the relay, and runs the event loop.
 func run() int {
 	var interfaces stringSlice
 	var noTransmitInterfaces stringSlice

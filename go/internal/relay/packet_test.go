@@ -445,12 +445,19 @@ func TestComputeIPChecksum(t *testing.T) {
 		}
 	})
 
-	t.Run("does not modify original", func(t *testing.T) {
-		original := make([]byte, len(dnsQuery))
-		copy(original, dnsQuery)
-		ComputeIPChecksum(dnsQuery, 20)
-		if !bytes.Equal(dnsQuery, original) {
-			t.Error("ComputeIPChecksum modified the input slice")
+	t.Run("modifies in place", func(t *testing.T) {
+		input := make([]byte, len(dnsQuery))
+		copy(input, dnsQuery)
+		input[10] = 0
+		input[11] = 0
+		result := ComputeIPChecksum(input, 20)
+		// result should be the same slice as input
+		if &result[0] != &input[0] {
+			t.Error("ComputeIPChecksum should return the same slice")
+		}
+		gotChecksum := binary.BigEndian.Uint16(input[10:12])
+		if gotChecksum != 0x8493 {
+			t.Errorf("in-place checksum = 0x%04x, want 0x8493", gotChecksum)
 		}
 	})
 

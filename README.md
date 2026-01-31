@@ -1,8 +1,8 @@
 Relay broadcast and multicast packets between interfaces
 --------------------------------------------------------
 
-A port to Go of the brilliant multicast-relay Python implementation
-by Al Smith.
+This is a port to Go of Al Smith's brilliant multicast-relay
+implementation originally written in Python.
 
 Useful, for example, if you have Sonos speakers on one interface, or VLAN,
 and you want to be able to control them from devices on a different
@@ -78,5 +78,4 @@ flag also encourages logging to stdout as well as to the syslog.
 `--logfile` saves log data to the specified file.
 
 `--verbose` steps up the logging.
-
 

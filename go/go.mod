@@ -1,4 +1,4 @@
-module github.com/alsmith/multicast-relay
+module github.com/mojo333/multicast-relay
 
 go 1.24.7
 
