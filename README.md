@@ -1,6 +1,9 @@
 Relay broadcast and multicast packets between interfaces
 --------------------------------------------------------
 
+A port to Go of the brilliant multicast-relay Python implementation
+by Al Smith.
+
 Useful, for example, if you have Sonos speakers on one interface, or VLAN,
 and you want to be able to control them from devices on a different
 interface/VLAN. Similar for Chromecast devices.
@@ -76,9 +79,4 @@ flag also encourages logging to stdout as well as to the syslog.
 
 `--verbose` steps up the logging.
 
-multicast-relay.py requires the python 'netifaces' package. Install via
-'easy_install netifaces' or 'pip install netifaces'. For ZeroShell users,
-please review [README-ZeroShell](README-ZeroShell.md) for further instructions.
-
-Al Smith <ajs@aeschi.eu>
 
