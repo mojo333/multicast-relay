@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"net"
+	"net/netip"
 	"testing"
 )
 
@@ -304,6 +305,9 @@ func TestIsMulticast(t *testing.T) {
 		{"192.168.1.1", false},
 		{"255.255.255.255", false},
 		{"10.0.0.1", false},
+		{"not-an-ip", false},
+		{"", false},
+		{"999.999.999.999", false},
 	}
 	for _, tt := range tests {
 		if got := IsMulticast(tt.ip); got != tt.expected {
@@ -322,13 +326,33 @@ func TestIsBroadcast(t *testing.T) {
 }
 
 func TestMulticastIPToMAC(t *testing.T) {
-	mac := MulticastIPToMAC("239.255.255.250")
-	expected := []byte{0x01, 0x00, 0x5e, 0x7f, 0xff, 0xfa}
-	for i := range expected {
-		if mac[i] != expected[i] {
-			t.Errorf("byte %d: got 0x%02x, want 0x%02x", i, mac[i], expected[i])
+	t.Run("valid multicast IP", func(t *testing.T) {
+		mac := MulticastIPToMAC("239.255.255.250")
+		expected := []byte{0x01, 0x00, 0x5e, 0x7f, 0xff, 0xfa}
+		for i := range expected {
+			if mac[i] != expected[i] {
+				t.Errorf("byte %d: got 0x%02x, want 0x%02x", i, mac[i], expected[i])
+			}
 		}
-	}
+	})
+
+	t.Run("invalid IP returns nil", func(t *testing.T) {
+		if mac := MulticastIPToMAC("not-an-ip"); mac != nil {
+			t.Errorf("expected nil for invalid IP, got %v", mac)
+		}
+	})
+
+	t.Run("IPv6 address returns nil", func(t *testing.T) {
+		if mac := MulticastIPToMAC("ff02::1"); mac != nil {
+			t.Errorf("expected nil for IPv6 address, got %v", mac)
+		}
+	})
+
+	t.Run("empty string returns nil", func(t *testing.T) {
+		if mac := MulticastIPToMAC(""); mac != nil {
+			t.Errorf("expected nil for empty string, got %v", mac)
+		}
+	})
 }
 
 func TestOnNetwork(t *testing.T) {
@@ -376,6 +400,25 @@ func TestIP2LongRoundTrip(t *testing.T) {
 		if got != ip {
 			t.Errorf("round-trip failed for %s: got %s", ip, got)
 		}
+	}
+}
+
+func TestIP2LongInvalid(t *testing.T) {
+	tests := []struct {
+		name string
+		ip   string
+	}{
+		{"empty string", ""},
+		{"garbage", "not-an-ip"},
+		{"IPv6", "::1"},
+		{"out of range", "999.999.999.999"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IP2Long(tt.ip); got != 0 {
+				t.Errorf("IP2Long(%q) = %d, want 0", tt.ip, got)
+			}
+		})
 	}
 }
 
@@ -544,6 +587,54 @@ func TestComputeUDPChecksum(t *testing.T) {
 			t.Errorf("UDP checksum = 0x%04x, want 0x3e62", gotChecksum)
 		}
 	})
+}
+
+func TestOnNetworkPrefix(t *testing.T) {
+	prefix := netip.MustParsePrefix("192.168.1.0/24")
+	tests := []struct {
+		name     string
+		ip       string
+		expected bool
+	}{
+		{"in range", "192.168.1.100", true},
+		{"network address", "192.168.1.0", true},
+		{"broadcast", "192.168.1.255", true},
+		{"out of range", "192.168.2.1", false},
+		{"invalid IP", "not-an-ip", false},
+		{"empty string", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := OnNetworkPrefix(tt.ip, prefix); got != tt.expected {
+				t.Errorf("OnNetworkPrefix(%q, %s) = %v, want %v", tt.ip, prefix, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestAddrFrom4Bytes(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    []byte
+		expected string
+	}{
+		{"loopback", []byte{127, 0, 0, 1}, "127.0.0.1"},
+		{"private", []byte{192, 168, 1, 1}, "192.168.1.1"},
+		{"zeros", []byte{0, 0, 0, 0}, "0.0.0.0"},
+		{"broadcast", []byte{255, 255, 255, 255}, "255.255.255.255"},
+		{"class A", []byte{10, 0, 0, 1}, "10.0.0.1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			addr := AddrFrom4Bytes(tt.input)
+			if got := addr.String(); got != tt.expected {
+				t.Errorf("AddrFrom4Bytes(%v) = %s, want %s", tt.input, got, tt.expected)
+			}
+			if !addr.Is4() {
+				t.Error("expected Is4() to be true")
+			}
+		})
+	}
 }
 
 func TestMdnsSetUnicastBit(t *testing.T) {

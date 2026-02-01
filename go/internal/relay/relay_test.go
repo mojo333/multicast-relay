@@ -2,10 +2,13 @@ package relay
 
 import (
 	"encoding/json"
+	"errors"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestIsDuplicate(t *testing.T) {
@@ -311,5 +314,77 @@ func TestParseIfFilterFileIntegration(t *testing.T) {
 	}
 	if !pr.isAllowedByFilter("10.0.0.1", "wlan0") {
 		t.Error("expected 10.0.0.1 allowed to any interface (no matching filter)")
+	}
+}
+
+// --- Buffer pool tests ---
+
+func TestGetPutBuffer(t *testing.T) {
+	bp := getBuffer(100)
+	b := *bp
+	if len(b) != 100 {
+		t.Errorf("getBuffer(100) length = %d, want 100", len(b))
+	}
+	if cap(b) < 100 {
+		t.Errorf("getBuffer(100) capacity = %d, want >= 100", cap(b))
+	}
+	// Write some data and return to pool
+	for i := range b {
+		b[i] = byte(i)
+	}
+	putBuffer(bp)
+
+	// Get another buffer — should reuse from pool
+	bp2 := getBuffer(50)
+	b2 := *bp2
+	if len(b2) != 50 {
+		t.Errorf("getBuffer(50) length = %d, want 50", len(b2))
+	}
+	putBuffer(bp2)
+}
+
+func TestGetBufferLargerThanPool(t *testing.T) {
+	// Request a buffer larger than the default pool capacity
+	bp := getBuffer(maxPacketSize + 1000)
+	b := *bp
+	if len(b) != maxPacketSize+1000 {
+		t.Errorf("getBuffer(%d) length = %d", maxPacketSize+1000, len(b))
+	}
+	putBuffer(bp)
+}
+
+// --- isENXIO tests ---
+
+func TestIsENXIO(t *testing.T) {
+	if !isENXIO(unix.ENXIO) {
+		t.Error("expected isENXIO(unix.ENXIO) = true")
+	}
+	if isENXIO(unix.ENOENT) {
+		t.Error("expected isENXIO(unix.ENOENT) = false")
+	}
+	if isENXIO(errors.New("some error")) {
+		t.Error("expected isENXIO(generic error) = false")
+	}
+	if isENXIO(nil) {
+		t.Error("expected isENXIO(nil) = false")
+	}
+}
+
+// --- isDuplicate checksumCount clamp branch ---
+
+func TestIsDuplicateChecksumCountClamp(t *testing.T) {
+	// Directly set checksumCount beyond maxRecentChecksums to exercise
+	// the clamping branch in isDuplicate.
+	pr := &PacketRelay{}
+	pr.checksumCount = maxRecentChecksums + 10
+	pr.recentChecksums[0] = 0xABCD
+
+	// Should still find the value (clamps search to maxRecentChecksums)
+	if !pr.isDuplicate(0xABCD) {
+		t.Error("expected isDuplicate to find 0xABCD with clamped count")
+	}
+	// Should not find a value that isn't there
+	if pr.isDuplicate(0x1111) {
+		t.Error("expected isDuplicate to not find 0x1111")
 	}
 }
