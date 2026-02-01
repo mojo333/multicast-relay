@@ -2,7 +2,15 @@ Relay broadcast and multicast packets between interfaces
 --------------------------------------------------------
 
 This is a port to Go of Al Smith's brilliant multicast-relay
-implementation originally written in Python.
+implementation originally written in Python. Additional fixes and
+optimisations have been made.
+
+To run this on an Unifi Dream Machine Pro use the command
+
+`nohup /data/multicast-relay/multicast-relay-arm64 --interfaces br0 br50 br99 </dev/null >/dev/null 2>&1 &`
+
+Ensure that the path points to the binary and that the interfaces
+are the ones you want to listen to.
 
 Useful, for example, if you have Sonos speakers on one interface, or VLAN,
 and you want to be able to control them from devices on a different
