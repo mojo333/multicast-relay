@@ -293,6 +293,90 @@ func TestModifyUDPPacket(t *testing.T) {
 	})
 }
 
+func TestModifyUDPPacketWithIPOptions(t *testing.T) {
+	// Build a packet with IP options (IHL=6, 24-byte IP header)
+	// Bytes 0-19: standard IP header, bytes 20-23: IP options
+	ipHeader := []byte{
+		0x46, 0x00,                         // version=4, IHL=6 (24 bytes)
+		0x00, 0x24,                         // total length = 36 (24 IP + 8 UDP + 4 data)
+		0x12, 0x34, 0x40, 0x00,             // ID, flags, fragment offset
+		0x40, 0x11,                         // TTL=64, protocol=UDP
+		0x00, 0x00,                         // checksum (will be recomputed)
+		0xc0, 0xa8, 0x01, 0x64,             // src: 192.168.1.100
+		0xc0, 0xa8, 0x01, 0x01,             // dst: 192.168.1.1
+		0x01, 0x02, 0x03, 0x04,             // IP options (4 bytes)
+	}
+	udpHeader := []byte{
+		0x04, 0xd2, 0x00, 0x35,             // src port 1234, dst port 53
+		0x00, 0x0c,                         // UDP length = 12
+		0x00, 0x00,                         // checksum
+	}
+	udpData := []byte{0xAA, 0xBB, 0xCC, 0xDD}
+
+	pkt := make([]byte, 0, len(ipHeader)+len(udpHeader)+len(udpData))
+	pkt = append(pkt, ipHeader...)
+	pkt = append(pkt, udpHeader...)
+	pkt = append(pkt, udpData...)
+
+	t.Run("preserves IP options when changing addresses", func(t *testing.T) {
+		result := ModifyUDPPacket(pkt, 24, "10.0.0.1", 5678, "10.0.0.2", 80)
+
+		// Verify IHL is preserved
+		if result[0] != 0x46 {
+			t.Errorf("IHL byte = 0x%02x, want 0x46", result[0])
+		}
+
+		// Verify new source IP at fixed offset 12
+		if result[12] != 0x0a || result[13] != 0x00 || result[14] != 0x00 || result[15] != 0x01 {
+			t.Errorf("source IP mismatch: got %v, want 10.0.0.1", result[12:16])
+		}
+
+		// Verify new dest IP at fixed offset 16
+		if result[16] != 0x0a || result[17] != 0x00 || result[18] != 0x00 || result[19] != 0x02 {
+			t.Errorf("dest IP mismatch: got %v, want 10.0.0.2", result[16:20])
+		}
+
+		// Verify IP options are preserved at bytes 20-23
+		if result[20] != 0x01 || result[21] != 0x02 || result[22] != 0x03 || result[23] != 0x04 {
+			t.Errorf("IP options corrupted: got %v, want [01 02 03 04]", result[20:24])
+		}
+
+		// Verify new ports
+		srcPort := binary.BigEndian.Uint16(result[24:26])
+		dstPort := binary.BigEndian.Uint16(result[26:28])
+		if srcPort != 5678 {
+			t.Errorf("source port = %d, want 5678", srcPort)
+		}
+		if dstPort != 80 {
+			t.Errorf("dest port = %d, want 80", dstPort)
+		}
+
+		// Verify UDP data is preserved
+		if result[32] != 0xAA || result[33] != 0xBB || result[34] != 0xCC || result[35] != 0xDD {
+			t.Errorf("UDP data corrupted: got %v", result[32:36])
+		}
+
+		// Verify total packet length is correct
+		if len(result) != len(pkt) {
+			t.Errorf("result length = %d, want %d", len(result), len(pkt))
+		}
+	})
+
+	t.Run("no changes preserves options", func(t *testing.T) {
+		result := ModifyUDPPacket(pkt, 24, "", 0, "", 0)
+
+		// IP options should still be intact
+		if result[20] != 0x01 || result[21] != 0x02 || result[22] != 0x03 || result[23] != 0x04 {
+			t.Errorf("IP options corrupted: got %v, want [01 02 03 04]", result[20:24])
+		}
+
+		// Length should be preserved
+		if len(result) != len(pkt) {
+			t.Errorf("result length = %d, want %d", len(result), len(pkt))
+		}
+	})
+}
+
 func TestIsMulticast(t *testing.T) {
 	tests := []struct {
 		ip       string

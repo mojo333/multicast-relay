@@ -1,0 +1,3 @@
+# Compiled binaries
+go/multicast-relay-*
+bin/

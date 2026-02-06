@@ -64,6 +64,7 @@ func run() int {
 	foreground := flag.Bool("foreground", false, "Do not background, log to stdout.")
 	logfile := flag.String("logfile", "", "Save logs to this file.")
 	verbose := flag.Bool("verbose", false, "Enable verbose output.")
+	monitor := flag.String("monitor", "", "Write startup, errors, and shutdown events to this log file.")
 
 	// Parse with support for space-separated values after a single flag
 	flag.Parse()
@@ -101,6 +102,19 @@ func run() int {
 		fmt.Fprintf(os.Stderr, "Error initializing logger: %s\n", err)
 		return 1
 	}
+	defer log.Close()
+
+	// Set up monitor log if requested
+	if *monitor != "" {
+		if err := log.SetMonitor(*monitor); err != nil {
+			fmt.Fprintf(os.Stderr, "Error initializing monitor log: %s\n", err)
+			return 1
+		}
+	}
+
+	// Log startup to monitor
+	log.Monitor("Process started (pid %d)", os.Getpid())
+	log.Monitor("Parameters: %s", formatArgs())
 
 	// Build relay set
 	type relayEntry struct {
@@ -151,11 +165,14 @@ func run() int {
 
 	packetRelay, err := relay.New(cfg)
 	if err != nil {
+		log.Error("Error initializing relay: %s", err)
+		log.Monitor("Process exiting: relay init error: %s", err)
 		fmt.Fprintf(os.Stderr, "Error initializing relay: %s\n", err)
 		return 1
 	}
 
 	// Add listeners for each relay address
+	var services []string
 	for _, entry := range relaySet {
 		parts := strings.SplitN(entry.addrPort, ":", 2)
 		if len(parts) != 2 {
@@ -165,6 +182,7 @@ func run() int {
 			} else {
 				log.Warning("%s", msg)
 			}
+			log.Monitor("Process exiting: %s", msg)
 			return 1
 		}
 		addr := parts[0]
@@ -176,6 +194,7 @@ func run() int {
 			} else {
 				log.Warning("%s", msg)
 			}
+			log.Monitor("Process exiting: %s", msg)
 			return 1
 		}
 
@@ -194,6 +213,7 @@ func run() int {
 			} else {
 				log.Warning("%s", msg)
 			}
+			log.Monitor("Process exiting: %s", msg)
 			return 1
 		}
 
@@ -204,6 +224,7 @@ func run() int {
 			} else {
 				log.Warning("%s", msg)
 			}
+			log.Monitor("Process exiting: %s", msg)
 			return 1
 		}
 
@@ -214,23 +235,65 @@ func run() int {
 		log.Info("Adding %s relay for %s:%d%s", relayType, addr, port, serviceSuffix)
 
 		if err := packetRelay.AddListener(addr, port, entry.service); err != nil {
+			log.Error("Error adding listener for %s:%d: %s", addr, port, err)
+			log.Monitor("Process exiting: listener error for %s:%d: %s", addr, port, err)
 			fmt.Fprintf(os.Stderr, "Error adding listener for %s:%d: %s\n", addr, port, err)
 			return 1
 		}
+
+		label := fmt.Sprintf("%s %s:%d", relayType, addr, port)
+		if entry.service != "" {
+			label = entry.service
+		}
+		services = append(services, label)
 	}
+
+	log.Monitor("Relay active: interfaces=%v services=[%s]",
+		[]string(interfaces), strings.Join(services, ", "))
 
 	// Handle signals for graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
-		<-sigCh
-		os.Exit(0)
+		sig := <-sigCh
+		log.Monitor("Received signal %s, shutting down", sig)
+		packetRelay.Close()
 	}()
 
 	if err := packetRelay.Loop(); err != nil {
+		log.Error("Relay error: %s", err)
+		log.Monitor("Process exiting: relay error: %s", err)
 		fmt.Fprintf(os.Stderr, "Relay error: %s\n", err)
 		return 1
 	}
 
+	log.Monitor("Process exiting: clean shutdown")
 	return 0
+}
+
+// formatArgs returns a string representation of the command-line arguments,
+// masking the AES key if present.
+func formatArgs() string {
+	args := os.Args[1:]
+	var parts []string
+	maskNext := false
+	for _, arg := range args {
+		if maskNext {
+			parts = append(parts, "****")
+			maskNext = false
+			continue
+		}
+		if arg == "--aes" || arg == "-aes" {
+			parts = append(parts, arg)
+			maskNext = true
+			continue
+		}
+		if strings.HasPrefix(arg, "--aes=") || strings.HasPrefix(arg, "-aes=") {
+			eqIdx := strings.Index(arg, "=")
+			parts = append(parts, arg[:eqIdx+1]+"****")
+			continue
+		}
+		parts = append(parts, arg)
+	}
+	return strings.Join(parts, " ")
 }

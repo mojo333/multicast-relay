@@ -15,9 +15,9 @@ type multiHandler struct {
 	handlers []slog.Handler
 }
 
-func (h *multiHandler) Enabled(_ context.Context, level slog.Level) bool {
+func (h *multiHandler) Enabled(ctx context.Context, level slog.Level) bool {
 	for _, handler := range h.handlers {
-		if handler.Enabled(context.Background(), level) {
+		if handler.Enabled(ctx, level) {
 			return true
 		}
 	}
@@ -53,7 +53,9 @@ func (h *multiHandler) WithGroup(name string) slog.Handler {
 
 // Logger wraps slog.Logger with Info/Warning methods matching the original API.
 type Logger struct {
-	slog *slog.Logger
+	slog        *slog.Logger
+	monitor     *slog.Logger // always-on monitor logger (nil if --monitor not set)
+	monitorFile *os.File     // monitor file handle for closing on shutdown
 }
 
 // New creates a new Logger backed by slog.
@@ -114,14 +116,61 @@ func New(foreground bool, logfile string, verbose bool) (*Logger, error) {
 	return &Logger{slog: slog.New(handler)}, nil
 }
 
+// SetMonitor opens a monitor log file that always records at Info level.
+// The monitor log captures lifecycle events (startup, shutdown) and all warnings/errors.
+func (l *Logger) SetMonitor(path string) error {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return fmt.Errorf("cannot open monitor log %s: %w", path, err)
+	}
+	l.monitorFile = f
+	l.monitor = slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	return nil
+}
+
+// Monitor writes a message to the monitor log only (always at Info level).
+// Used for lifecycle events like startup and shutdown. No-op if monitor is not configured.
+func (l *Logger) Monitor(format string, args ...interface{}) {
+	if l.monitor != nil {
+		l.monitor.Info(fmt.Sprintf(format, args...))
+	}
+}
+
 // Info logs an informational message (only emitted when verbose is enabled).
 func (l *Logger) Info(format string, args ...interface{}) {
 	l.slog.Info(fmt.Sprintf(format, args...))
 }
 
 // Warning logs a warning message (always emitted).
+// Also writes to the monitor log if configured.
 func (l *Logger) Warning(format string, args ...interface{}) {
-	l.slog.Warn(fmt.Sprintf(format, args...))
+	msg := fmt.Sprintf(format, args...)
+	l.slog.Warn(msg)
+	if l.monitor != nil {
+		l.monitor.Warn(msg)
+	}
+}
+
+// Error logs an error message at ERROR level.
+// Also writes to the monitor log if configured.
+func (l *Logger) Error(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	l.slog.Error(msg)
+	if l.monitor != nil {
+		l.monitor.Error(msg)
+	}
+}
+
+// Close flushes and closes the monitor log file if open.
+func (l *Logger) Close() {
+	if l.monitorFile != nil {
+		l.monitorFile.Sync()
+		l.monitorFile.Close()
+		l.monitorFile = nil
+		l.monitor = nil
+	}
 }
 
 // syslogWriter adapts *syslog.Writer to io.Writer.

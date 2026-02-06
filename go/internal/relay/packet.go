@@ -99,10 +99,15 @@ func ModifyUDPPacket(data []byte, ipHeaderLength int, newSrcAddr string, newSrcP
 		dstPort = newDstPort
 	}
 
+	// Build IP header: bytes 0-11 (version/IHL/TOS/len/id/flags/TTL/proto/checksum),
+	// then src+dst at fixed offsets 12-19, then any IP options (byte 20+).
 	ipHeader := make([]byte, 0, ipHeaderLength)
-	ipHeader = append(ipHeader, data[:ipHeaderLength-8]...)
+	ipHeader = append(ipHeader, data[:12]...)
 	ipHeader = append(ipHeader, srcAddr...)
 	ipHeader = append(ipHeader, dstAddr...)
+	if ipHeaderLength > 20 {
+		ipHeader = append(ipHeader, data[20:ipHeaderLength]...)
+	}
 
 	udpData := data[ipHeaderLength+8:]
 	udpLength := uint16(8 + len(udpData))

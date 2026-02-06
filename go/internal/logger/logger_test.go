@@ -194,3 +194,184 @@ func TestInfoLevel(t *testing.T) {
 		t.Errorf("expected INFO level in output, got: %s", content)
 	}
 }
+
+// --- Monitor log tests ---
+
+func TestSetMonitor(t *testing.T) {
+	dir := t.TempDir()
+	monPath := filepath.Join(dir, "monitor.log")
+
+	l, err := New(false, "", false)
+	if err != nil {
+		t.Fatalf("New error: %v", err)
+	}
+	defer l.Close()
+
+	if err := l.SetMonitor(monPath); err != nil {
+		t.Fatalf("SetMonitor error: %v", err)
+	}
+
+	l.Monitor("startup pid=%d", 12345)
+	l.Monitor("relay active")
+
+	data, err := os.ReadFile(monPath)
+	if err != nil {
+		t.Fatalf("reading monitor log: %v", err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "startup pid=12345") {
+		t.Errorf("monitor log missing startup message, got: %s", content)
+	}
+	if !strings.Contains(content, "relay active") {
+		t.Errorf("monitor log missing relay active message, got: %s", content)
+	}
+}
+
+func TestSetMonitorInvalidPath(t *testing.T) {
+	l, err := New(false, "", false)
+	if err != nil {
+		t.Fatalf("New error: %v", err)
+	}
+	defer l.Close()
+
+	if err := l.SetMonitor("/nonexistent/dir/monitor.log"); err == nil {
+		t.Error("expected error for invalid monitor path")
+	}
+}
+
+func TestMonitorNoOpWithoutSetMonitor(t *testing.T) {
+	l, err := New(false, "", false)
+	if err != nil {
+		t.Fatalf("New error: %v", err)
+	}
+	defer l.Close()
+
+	// Should not panic when monitor is not configured
+	l.Monitor("this goes nowhere")
+}
+
+func TestWarningWritesToMonitor(t *testing.T) {
+	dir := t.TempDir()
+	monPath := filepath.Join(dir, "monitor.log")
+
+	l, err := New(false, "", false)
+	if err != nil {
+		t.Fatalf("New error: %v", err)
+	}
+	defer l.Close()
+
+	if err := l.SetMonitor(monPath); err != nil {
+		t.Fatalf("SetMonitor error: %v", err)
+	}
+
+	l.Warning("something went wrong on %s", "eth0")
+
+	data, err := os.ReadFile(monPath)
+	if err != nil {
+		t.Fatalf("reading monitor log: %v", err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "something went wrong on eth0") {
+		t.Errorf("monitor log missing warning message, got: %s", content)
+	}
+	if !strings.Contains(content, "WARN") {
+		t.Errorf("expected WARN level in monitor log, got: %s", content)
+	}
+}
+
+func TestErrorWritesToMonitor(t *testing.T) {
+	dir := t.TempDir()
+	monPath := filepath.Join(dir, "monitor.log")
+
+	l, err := New(false, "", false)
+	if err != nil {
+		t.Fatalf("New error: %v", err)
+	}
+	defer l.Close()
+
+	if err := l.SetMonitor(monPath); err != nil {
+		t.Fatalf("SetMonitor error: %v", err)
+	}
+
+	l.Error("fatal problem: %s", "disk full")
+
+	data, err := os.ReadFile(monPath)
+	if err != nil {
+		t.Fatalf("reading monitor log: %v", err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "fatal problem: disk full") {
+		t.Errorf("monitor log missing error message, got: %s", content)
+	}
+	if !strings.Contains(content, "ERROR") {
+		t.Errorf("expected ERROR level in monitor log, got: %s", content)
+	}
+}
+
+func TestMonitorSeparateFromMainLog(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "main.log")
+	monPath := filepath.Join(dir, "monitor.log")
+
+	// Non-verbose: Info goes to main log only when verbose
+	l, err := New(false, logPath, false)
+	if err != nil {
+		t.Fatalf("New error: %v", err)
+	}
+	defer l.Close()
+
+	if err := l.SetMonitor(monPath); err != nil {
+		t.Fatalf("SetMonitor error: %v", err)
+	}
+
+	// Monitor messages should only go to monitor log
+	l.Monitor("lifecycle event")
+
+	// Info should be suppressed in non-verbose main log
+	l.Info("verbose only info")
+
+	mainData, _ := os.ReadFile(logPath)
+	monData, _ := os.ReadFile(monPath)
+
+	if strings.Contains(string(mainData), "lifecycle event") {
+		t.Error("Monitor message should not appear in main log")
+	}
+	if !strings.Contains(string(monData), "lifecycle event") {
+		t.Error("Monitor message should appear in monitor log")
+	}
+	if strings.Contains(string(monData), "verbose only info") {
+		t.Error("Info messages should not appear in monitor log")
+	}
+}
+
+func TestCloseFlushesMonitor(t *testing.T) {
+	dir := t.TempDir()
+	monPath := filepath.Join(dir, "monitor.log")
+
+	l, err := New(false, "", false)
+	if err != nil {
+		t.Fatalf("New error: %v", err)
+	}
+
+	if err := l.SetMonitor(monPath); err != nil {
+		t.Fatalf("SetMonitor error: %v", err)
+	}
+
+	l.Monitor("before close")
+	l.Close()
+
+	// After close, Monitor should be a no-op (not panic)
+	l.Monitor("after close")
+
+	data, _ := os.ReadFile(monPath)
+	content := string(data)
+	if !strings.Contains(content, "before close") {
+		t.Error("monitor log missing pre-close message")
+	}
+	if strings.Contains(content, "after close") {
+		t.Error("monitor should not write after Close()")
+	}
+
+	// Double close should not panic
+	l.Close()
+}

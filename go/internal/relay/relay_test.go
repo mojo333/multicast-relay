@@ -1,12 +1,18 @@
 package relay
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/mojo333/multicast-relay/internal/cipher"
+	"github.com/mojo333/multicast-relay/internal/logger"
 
 	"golang.org/x/sys/unix"
 )
@@ -386,5 +392,254 @@ func TestIsDuplicateChecksumCountClamp(t *testing.T) {
 	// Should not find a value that isn't there
 	if pr.isDuplicate(0x1111) {
 		t.Error("expected isDuplicate to not find 0x1111")
+	}
+}
+
+// --- UDP max length alignment test ---
+
+func TestUDPMaxLengthAlignment(t *testing.T) {
+	// udpMaxLength must be a multiple of 8 for proper IP fragmentation
+	if udpMaxLength%8 != 0 {
+		t.Errorf("udpMaxLength=%d is not a multiple of 8", udpMaxLength)
+	}
+}
+
+// --- removeConnection tests ---
+
+func newTestLogger(t *testing.T) *logger.Logger {
+	t.Helper()
+	log, err := logger.New(false, "", false)
+	if err != nil {
+		t.Fatalf("failed to create logger: %v", err)
+	}
+	return log
+}
+
+func TestRemoveConnectionFromRemoteConnections(t *testing.T) {
+	pr := &PacketRelay{
+		remoteReadBufs: make(map[net.Conn]*remoteReadBuf),
+	}
+
+	// Create a pair of connected pipes to use as mock connections
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	server2, client2 := net.Pipe()
+	defer server2.Close()
+	defer client2.Close()
+
+	pr.remoteConnections = []net.Conn{server, server2}
+	pr.remoteReadBufs[server] = &remoteReadBuf{msgLen: -1}
+	pr.remoteReadBufs[server2] = &remoteReadBuf{msgLen: -1}
+
+	pr.removeConnection(server)
+
+	if len(pr.remoteConnections) != 1 {
+		t.Errorf("expected 1 remaining connection, got %d", len(pr.remoteConnections))
+	}
+	if pr.remoteConnections[0] != server2 {
+		t.Error("wrong connection removed")
+	}
+	if _, ok := pr.remoteReadBufs[server]; ok {
+		t.Error("read buffer for removed connection should be deleted")
+	}
+}
+
+func TestRemoveConnectionFromRemoteAddrs(t *testing.T) {
+	pr := &PacketRelay{
+		remoteReadBufs: make(map[net.Conn]*remoteReadBuf),
+	}
+
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	ra := &RemoteAddr{Addr: "10.0.0.1", Conn: server}
+	pr.remoteAddrs = []*RemoteAddr{ra}
+
+	pr.removeConnection(server)
+
+	if ra.Conn != nil {
+		t.Error("expected RemoteAddr.Conn to be nil after removal")
+	}
+	if ra.ConnectFailure.IsZero() {
+		t.Error("expected ConnectFailure to be set after removal")
+	}
+}
+
+// --- Remote relay protocol tests ---
+
+func TestReadRemoteConnections(t *testing.T) {
+	log := newTestLogger(t)
+	aes := cipher.New("")
+
+	pr := &PacketRelay{
+		logger:         log,
+		aes:            aes,
+		noRemoteRelay:  true, // prevent processPacket from writing back to remotes
+		remoteReadBufs: make(map[net.Conn]*remoteReadBuf),
+	}
+
+	// Create a pipe to simulate a remote connection
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	pr.remoteConnections = []net.Conn{server}
+
+	// Build a valid remote relay message: 2-byte length + magic + senderIP + packet
+	// Minimum packet is 28 bytes (20 IP header + 8 UDP header)
+	ipHeader := make([]byte, 20)
+	ipHeader[0] = 0x45 // version 4, IHL 5
+	ipHeader[8] = 64   // TTL
+	ipHeader[9] = 17   // UDP protocol
+	copy(ipHeader[12:16], net.ParseIP("192.168.1.100").To4())
+	copy(ipHeader[16:20], net.ParseIP("239.255.255.250").To4())
+	binary.BigEndian.PutUint16(ipHeader[2:4], 28) // total length
+
+	udpHeader := make([]byte, 8)
+	binary.BigEndian.PutUint16(udpHeader[0:2], 1234) // src port
+	binary.BigEndian.PutUint16(udpHeader[2:4], 1900) // dst port
+	binary.BigEndian.PutUint16(udpHeader[4:6], 8)    // udp length
+
+	packetData := append(ipHeader, udpHeader...)
+
+	senderIP := net.ParseIP("192.168.1.100").To4()
+	payload := make([]byte, 0, 4+4+len(packetData))
+	payload = append(payload, magicBytes[:]...)
+	payload = append(payload, senderIP...)
+	payload = append(payload, packetData...)
+
+	encrypted, _ := aes.Encrypt(payload)
+	msg := make([]byte, 2+len(encrypted))
+	binary.BigEndian.PutUint16(msg[0:2], uint16(len(encrypted)))
+	copy(msg[2:], encrypted)
+
+	// Write the message from the client side (simulating remote sender)
+	go func() {
+		client.Write(msg)
+	}()
+
+	// Give the write a moment to complete
+	time.Sleep(50 * time.Millisecond)
+
+	var ssdpSrc ssdpSearchSource
+	// This should read the message without panicking or erroring
+	pr.readRemoteConnections(&ssdpSrc)
+
+	// Verify the read buffer was initialized
+	if _, ok := pr.remoteReadBufs[server]; !ok {
+		t.Error("expected read buffer to be created for connection")
+	}
+}
+
+func TestReadRemoteConnectionsInvalidMagic(t *testing.T) {
+	log := newTestLogger(t)
+	aes := cipher.New("")
+
+	pr := &PacketRelay{
+		logger:         log,
+		aes:            aes,
+		noRemoteRelay:  true,
+		remoteReadBufs: make(map[net.Conn]*remoteReadBuf),
+	}
+
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	pr.remoteConnections = []net.Conn{server}
+
+	// Build a message with invalid magic bytes
+	payload := make([]byte, 4+4+28) // magic + senderIP + min packet
+	payload[0] = 'X'                // wrong magic
+
+	encrypted, _ := aes.Encrypt(payload)
+	msg := make([]byte, 2+len(encrypted))
+	binary.BigEndian.PutUint16(msg[0:2], uint16(len(encrypted)))
+	copy(msg[2:], encrypted)
+
+	go func() {
+		client.Write(msg)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	var ssdpSrc ssdpSearchSource
+	// Should not panic — just log and skip the invalid message
+	pr.readRemoteConnections(&ssdpSrc)
+}
+
+func TestReadRemoteConnectionsDeadConnection(t *testing.T) {
+	log := newTestLogger(t)
+	aes := cipher.New("")
+
+	pr := &PacketRelay{
+		logger:         log,
+		aes:            aes,
+		noRemoteRelay:  true,
+		remoteReadBufs: make(map[net.Conn]*remoteReadBuf),
+	}
+
+	server, client := net.Pipe()
+
+	pr.remoteConnections = []net.Conn{server}
+
+	// Close the client side to simulate a dead connection
+	client.Close()
+
+	var ssdpSrc ssdpSearchSource
+	pr.readRemoteConnections(&ssdpSrc)
+
+	// The dead connection should have been removed
+	if len(pr.remoteConnections) != 0 {
+		t.Errorf("expected 0 connections after dead conn cleanup, got %d", len(pr.remoteConnections))
+	}
+	server.Close()
+}
+
+// --- Close/shutdown tests ---
+
+func TestCloseSignalsLoop(t *testing.T) {
+	pr := &PacketRelay{
+		done:           make(chan struct{}),
+		remoteReadBufs: make(map[net.Conn]*remoteReadBuf),
+	}
+
+	pr.Close()
+
+	// done channel should be closed
+	select {
+	case <-pr.done:
+		// good
+	default:
+		t.Error("expected done channel to be closed after Close()")
+	}
+
+	// Calling Close again should not panic
+	pr.Close()
+}
+
+func TestRemoteSocketsCollectsAll(t *testing.T) {
+	pr := &PacketRelay{}
+
+	server1, client1 := net.Pipe()
+	defer server1.Close()
+	defer client1.Close()
+
+	server2, client2 := net.Pipe()
+	defer server2.Close()
+	defer client2.Close()
+
+	pr.remoteConnections = []net.Conn{server1}
+	pr.remoteAddrs = []*RemoteAddr{
+		{Addr: "10.0.0.1", Conn: server2},
+		{Addr: "10.0.0.2", Conn: nil}, // not connected
+	}
+
+	conns := pr.remoteSockets()
+	if len(conns) != 2 {
+		t.Errorf("expected 2 connections, got %d", len(conns))
 	}
 }
