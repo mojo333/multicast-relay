@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 )
 
@@ -19,25 +20,23 @@ type Cipher struct {
 }
 
 // New creates a new Cipher. If key is empty, encryption is disabled (passthrough).
-func New(key string) *Cipher {
+func New(key string) (*Cipher, error) {
 	c := &Cipher{}
 	if key == "" {
-		return c
+		return c, nil
 	}
 	hash := sha256.Sum256([]byte(key))
 	block, err := aes.NewCipher(hash[:])
 	if err != nil {
-		// sha256 always produces 32 bytes, which is a valid AES-256 key,
-		// so this should never happen.
-		panic("cipher: failed to create AES block: " + err.Error())
+		return nil, fmt.Errorf("cipher: failed to create AES block: %w", err)
 	}
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		panic("cipher: failed to create GCM: " + err.Error())
+		return nil, fmt.Errorf("cipher: failed to create GCM: %w", err)
 	}
 	c.gcm = gcm
 	c.enabled = true
-	return c
+	return c, nil
 }
 
 // NonceSize returns the nonce size used by the cipher (12 bytes for GCM).

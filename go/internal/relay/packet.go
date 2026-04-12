@@ -136,17 +136,15 @@ func ModifyUDPPacket(data []byte, ipHeaderLength int, newSrcAddr string, newSrcP
 
 // MdnsSetUnicastBit sets the UNICAST-RESPONSE bit in mDNS query packets.
 func MdnsSetUnicastBit(data []byte, ipHeaderLength int) []byte {
-	headers := data[:ipHeaderLength+8]
-	udpData := make([]byte, len(data[ipHeaderLength+8:]))
-	copy(udpData, data[ipHeaderLength+8:])
-
-	flags := binary.BigEndian.Uint16(udpData[2:4])
+	udpDataStart := ipHeaderLength + 8
+	flags := binary.BigEndian.Uint16(data[udpDataStart+2 : udpDataStart+4])
 	if flags&0x8000 != 0 {
-		result := make([]byte, 0, len(data))
-		result = append(result, headers...)
-		result = append(result, udpData...)
-		return result
+		return data
 	}
+
+	headers := data[:udpDataStart]
+	udpData := make([]byte, len(data[udpDataStart:]))
+	copy(udpData, data[udpDataStart:])
 
 	queries := binary.BigEndian.Uint16(udpData[4:6])
 

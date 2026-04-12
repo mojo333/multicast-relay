@@ -41,9 +41,14 @@ const (
 const (
 	// maxPacketSize is the maximum expected packet size for pooled buffers.
 	maxPacketSize = 10240
+
+	minUDPPacketLen     = 28                // min IP(20)+UDP(8) header
+	maxRemoteMessageLen = maxPacketSize + 32 // cap on remote framing
 )
 
 var (
+	ipv4EtherType = [2]byte{0x08, 0x00}
+
 	magicBytes = [4]byte{'M', 'R', 'L', 'Y'}
 	zeroMAC    = net.HardwareAddr{0, 0, 0, 0, 0, 0}
 
@@ -159,7 +164,10 @@ type PacketRelay struct {
 	transmitters []Transmitter
 	receivers    []Receiver
 	etherAddrs   map[string]net.HardwareAddr
-	etherType    [2]byte
+
+	// ssdpSrc tracks the most recent SSDP M-SEARCH source for unicast reply routing.
+	// Only accessed from the single-threaded main loop.
+	ssdpSrc ssdpSearchSource
 
 	// Ring buffer for duplicate detection.
 	// Only accessed from the single-threaded main loop (Loop -> processPacket).
@@ -176,6 +184,8 @@ type PacketRelay struct {
 	noRemoteRelay     bool
 	aes               *cipher.Cipher
 	remoteConnections []net.Conn
+	connectedRemotes  []net.Conn // cached union of all active remote connections
+	connsDirty        bool       // true when connectedRemotes needs rebuilding
 	remoteReadBufs    map[net.Conn]*remoteReadBuf
 
 	// Pre-allocated poll structures rebuilt when receivers change.
@@ -197,6 +207,11 @@ func New(cfg Config) (*PacketRelay, error) {
 		masq[m] = true
 	}
 
+	aes, err := cipher.New(cfg.AESKey)
+	if err != nil {
+		return nil, err
+	}
+
 	pr := &PacketRelay{
 		interfaces:           cfg.Interfaces,
 		noTransmitInterfaces: noTx,
@@ -209,13 +224,13 @@ func New(cfg Config) (*PacketRelay, error) {
 		masquerade:           masq,
 		logger:               cfg.Logger,
 		etherAddrs:           make(map[string]net.HardwareAddr),
-		etherType:      [2]byte{0x08, 0x00}, // IPv4
-		remoteReadBufs: make(map[net.Conn]*remoteReadBuf),
-		listenAddr:     cfg.Listen,
+		remoteReadBufs:       make(map[net.Conn]*remoteReadBuf),
+		listenAddr:           cfg.Listen,
 		remotePort:           cfg.RemotePort,
 		remoteRetry:          cfg.RemoteRetry,
 		noRemoteRelay:        cfg.NoRemoteRelay,
-		aes:                  cipher.New(cfg.AESKey),
+		aes:                  aes,
+		connsDirty:           true,
 		pollDirty:            true,
 		done:                 make(chan struct{}),
 	}
@@ -345,24 +360,9 @@ func (pr *PacketRelay) AddListener(addr string, port int, service string) error 
 
 		// Create transmitter for this interface (unless in noTransmitInterfaces)
 		if !pr.noTransmitInterfaces[iface] {
-			txFd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, ethPAllBE)
+			txFd, err := createTransmitSocket(ifInfo.Name)
 			if err != nil {
-				return fmt.Errorf("cannot create transmit socket for %s: %w", ifInfo.Name, err)
-			}
-
-			ifIndex, err := interfaceIndex(ifInfo.Name)
-			if err != nil {
-				unix.Close(txFd)
-				return fmt.Errorf("cannot get interface index for %s: %w", ifInfo.Name, err)
-			}
-
-			sa := &unix.SockaddrLinklayer{
-				Protocol: uint16(ethPAllBE),
-				Ifindex:  ifIndex,
-			}
-			if err := unix.Bind(txFd, sa); err != nil {
-				unix.Close(txFd)
-				return fmt.Errorf("cannot bind transmit socket to %s: %w", ifInfo.Name, err)
+				return err
 			}
 
 			listenIP := addr
@@ -446,9 +446,7 @@ func (pr *PacketRelay) Close() {
 
 // Loop runs the main packet relay event loop.
 func (pr *PacketRelay) Loop() error {
-	var ssdpSrc ssdpSearchSource
-
-	buf := make([]byte, 10240)
+	buf := make([]byte, maxPacketSize)
 
 	for {
 		select {
@@ -457,7 +455,7 @@ func (pr *PacketRelay) Loop() error {
 		default:
 		}
 
-		if len(pr.remoteAddrs) > 0 {
+		if pr.hasUnconnectedRemotes() {
 			pr.connectRemotes()
 		}
 
@@ -477,6 +475,7 @@ func (pr *PacketRelay) Loop() error {
 				select {
 				case conn := <-pr.acceptCh:
 					pr.remoteConnections = append(pr.remoteConnections, conn)
+					pr.connsDirty = true
 					pr.logger.Info("REMOTE: Accepted connection from %s", conn.RemoteAddr())
 				default:
 					break drainAccept
@@ -485,7 +484,7 @@ func (pr *PacketRelay) Loop() error {
 		}
 
 		// Read from remote TCP connections
-		pr.readRemoteConnections(&ssdpSrc)
+		pr.readRemoteConnections()
 
 		// Clear revents before polling
 		for i := range pr.pollFds {
@@ -528,15 +527,15 @@ func (pr *PacketRelay) Loop() error {
 			}
 			senderAddr := AddrFrom4Bytes(sa.Addr[:]).String()
 
-			pr.processPacket(*dataBp, senderAddr, "local", &ssdpSrc)
+			pr.processPacket(*dataBp, senderAddr, "local")
 			putBuffer(dataBp)
 		}
 	}
 }
 
 // processPacket processes an incoming packet and relays it to other interfaces.
-func (pr *PacketRelay) processPacket(data []byte, senderAddr string, receivingInterface string, ssdpSrc *ssdpSearchSource) {
-	if len(data) < 28 { // min IP header + UDP header
+func (pr *PacketRelay) processPacket(data []byte, senderAddr string, receivingInterface string) {
+	if len(data) < minUDPPacketLen {
 		return
 	}
 
@@ -595,61 +594,24 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr string, receivingIn
 	srcPort := binary.BigEndian.Uint16(data[ipHeaderLength : ipHeaderLength+2])
 	dstPort := binary.BigEndian.Uint16(data[ipHeaderLength+2 : ipHeaderLength+4])
 
-	origSrcAddr := srcAddr
-	origSrcPort := srcPort
 	origDstAddr := dstAddr
 	origDstPort := dstPort
 
-	var destMac net.HardwareAddr
-
 	// mDNS unicast forcing
-	if pr.mdnsForceUnicast && dstAddr == MDNSMcastAddr && dstPort == MDNSMcastPort {
-		data = MdnsSetUnicastBit(data, ipHeaderLength)
-	}
+	data = pr.applyMDNS(data, ipHeaderLength, dstAddr, dstPort)
 
-	// SSDP M-SEARCH / NOTIFY interception (match only in UDP payload, not binary IP/UDP headers)
-	if pr.ssdpUnicastAddr != "" && dstAddr == SSDPMcastAddr && dstPort == SSDPMcastPort && ssdpSearchRe.Match(data[ipHeaderLength+8:]) {
-		ssdpSrc.addr = srcAddr
-		ssdpSrc.port = srcPort
-		ssdpSrc.set = true
-		pr.logger.Info("Last SSDP search source: %s:%d", srcAddr, srcPort)
-
-		srcAddr = pr.ssdpUnicastAddr
-		srcPort = SSDPUnicastPort
-		data = ModifyUDPPacket(data, ipHeaderLength, srcAddr, srcPort, "", 0)
-	} else if pr.ssdpUnicastAddr != "" && origDstAddr == pr.ssdpUnicastAddr && origDstPort == SSDPUnicastPort {
-		if !ssdpSrc.set {
-			return
-		}
-		dstAddr = ssdpSrc.addr
-		dstPort = ssdpSrc.port
-		pr.logger.Info("Received SSDP Unicast - received from %s:%d on %s:%d, need to relay to %s:%d",
-			origSrcAddr, origSrcPort, origDstAddr, origDstPort, dstAddr, dstPort)
-
-		data = ModifyUDPPacket(data, ipHeaderLength, "", 0, dstAddr, dstPort)
-
-		macStr, err := UnicastIPToMAC(dstAddr, "")
-		if err != nil || macStr == "" {
-			pr.logger.Info("Could not resolve MAC for %s", dstAddr)
-			return
-		}
-		destMac, err = net.ParseMAC(macStr)
-		if err != nil {
-			pr.logger.Info("Could not parse MAC %s: %s", macStr, err)
-			return
-		}
+	// SSDP M-SEARCH / NOTIFY interception
+	var destMac net.HardwareAddr
+	var drop bool
+	data, srcAddr, srcPort, dstAddr, dstPort, destMac, drop = pr.handleSSDP(data, ipHeaderLength, srcAddr, srcPort, dstAddr, dstPort)
+	if drop {
+		return
 	}
 
 	// Determine receiving interface
 	broadcastPacket := false
 	if receivingInterface == "local" {
-		for _, tx := range pr.transmitters {
-			if origDstAddr == tx.Relay.Addr && int(origDstPort) == tx.Relay.Port &&
-				OnNetwork(senderAddr, tx.Addr, tx.Netmask) {
-				receivingInterface = tx.Interface
-				broadcastPacket = (origDstAddr == tx.Broadcast)
-			}
-		}
+		receivingInterface, broadcastPacket = pr.findReceivingIface(senderAddr, origDstAddr, origDstPort)
 	}
 
 	// Relay to all other interfaces
@@ -713,7 +675,7 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr string, receivingIn
 
 			if err := pr.transmitPacket(tx, localDestMac, ipHeaderLength, txData); err != nil {
 				// Try to recover if ENXIO (device not configured)
-				if isENXIO(err) {
+				if err == unix.ENXIO {
 					pr.recoverTransmitter(tx, localDestMac, ipHeaderLength, txData)
 				} else {
 					pr.logger.Warning("Error sending packet: %s", err)
@@ -722,6 +684,72 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr string, receivingIn
 			putBuffer(txBp)
 		}
 	}
+}
+
+// applyMDNS sets the UNICAST-RESPONSE bit in mDNS query packets when mdnsForceUnicast is enabled.
+func (pr *PacketRelay) applyMDNS(data []byte, ipHeaderLength int, dstAddr string, dstPort uint16) []byte {
+	if pr.mdnsForceUnicast && dstAddr == MDNSMcastAddr && dstPort == MDNSMcastPort {
+		return MdnsSetUnicastBit(data, ipHeaderLength)
+	}
+	return data
+}
+
+// handleSSDP processes SSDP M-SEARCH interception and unicast reply routing.
+// It may modify srcAddr/srcPort (M-SEARCH), dstAddr/dstPort (unicast reply), data, and destMac.
+// Returns drop=true when the packet should be silently discarded.
+func (pr *PacketRelay) handleSSDP(data []byte, ipHeaderLength int, srcAddr string, srcPort uint16, dstAddr string, dstPort uint16) (outData []byte, outSrcAddr string, outSrcPort uint16, outDstAddr string, outDstPort uint16, destMac net.HardwareAddr, drop bool) {
+	outData, outSrcAddr, outSrcPort, outDstAddr, outDstPort = data, srcAddr, srcPort, dstAddr, dstPort
+
+	if pr.ssdpUnicastAddr != "" && dstAddr == SSDPMcastAddr && dstPort == SSDPMcastPort && ssdpSearchRe.Match(data[ipHeaderLength+8:]) {
+		pr.ssdpSrc.addr = srcAddr
+		pr.ssdpSrc.port = srcPort
+		pr.ssdpSrc.set = true
+		pr.logger.Info("Last SSDP search source: %s:%d", srcAddr, srcPort)
+
+		outSrcAddr = pr.ssdpUnicastAddr
+		outSrcPort = SSDPUnicastPort
+		outData = ModifyUDPPacket(data, ipHeaderLength, outSrcAddr, outSrcPort, "", 0)
+		return
+	}
+
+	if pr.ssdpUnicastAddr != "" && dstAddr == pr.ssdpUnicastAddr && dstPort == SSDPUnicastPort {
+		if !pr.ssdpSrc.set {
+			drop = true
+			return
+		}
+		outDstAddr = pr.ssdpSrc.addr
+		outDstPort = pr.ssdpSrc.port
+		pr.logger.Info("Received SSDP Unicast - received from %s:%d on %s:%d, need to relay to %s:%d",
+			srcAddr, srcPort, dstAddr, dstPort, outDstAddr, outDstPort)
+
+		outData = ModifyUDPPacket(data, ipHeaderLength, "", 0, outDstAddr, outDstPort)
+
+		macStr, err := UnicastIPToMAC(outDstAddr, "")
+		if err != nil || macStr == "" {
+			pr.logger.Info("Could not resolve MAC for %s", outDstAddr)
+			drop = true
+			return
+		}
+		destMac, err = net.ParseMAC(macStr)
+		if err != nil {
+			pr.logger.Info("Could not parse MAC %s: %s", macStr, err)
+			drop = true
+			return
+		}
+	}
+	return
+}
+
+// findReceivingIface identifies which local interface received a packet based on destination.
+func (pr *PacketRelay) findReceivingIface(senderAddr, origDstAddr string, origDstPort uint16) (ifaceName string, isBroadcast bool) {
+	for _, tx := range pr.transmitters {
+		if origDstAddr == tx.Relay.Addr && int(origDstPort) == tx.Relay.Port &&
+			OnNetwork(senderAddr, tx.Addr, tx.Netmask) {
+			ifaceName = tx.Interface
+			isBroadcast = (origDstAddr == tx.Broadcast)
+		}
+	}
+	return
 }
 
 // isDuplicate checks whether this checksum was recently seen.
@@ -772,24 +800,9 @@ func (pr *PacketRelay) recoverTransmitter(tx *Transmitter, destMac net.HardwareA
 		pr.logger.Warning("Recovery failed for %s: %s", tx.Interface, err)
 		return
 	}
-	newFd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, ethPAllBE)
+	newFd, err := createTransmitSocket(ifInfo.Name)
 	if err != nil {
 		pr.logger.Warning("Recovery socket creation failed for %s: %s", tx.Interface, err)
-		return
-	}
-	ifIdx, err := interfaceIndex(ifInfo.Name)
-	if err != nil {
-		unix.Close(newFd)
-		pr.logger.Warning("Recovery interface index failed for %s: %s", tx.Interface, err)
-		return
-	}
-	sa := &unix.SockaddrLinklayer{
-		Protocol: uint16(ethPAllBE),
-		Ifindex:  ifIdx,
-	}
-	if err := unix.Bind(newFd, sa); err != nil {
-		unix.Close(newFd)
-		pr.logger.Warning("Recovery bind failed for %s: %s", tx.Interface, err)
 		return
 	}
 	unix.Close(tx.Socket)
@@ -872,7 +885,7 @@ func (pr *PacketRelay) transmitPacket(tx *Transmitter, destMac net.HardwareAddr,
 			// Prepend ethernet header: destMac + srcMac + etherType
 			copy(scratch[0:6], destMac)
 			copy(scratch[6:12], tx.MAC)
-			copy(scratch[12:14], pr.etherType[:])
+			copy(scratch[12:14], ipv4EtherType[:])
 			frame = scratch[:14+totalLength]
 		} else {
 			frame = ipPacket
@@ -1009,8 +1022,8 @@ type remoteReadBuf struct {
 }
 
 // readRemoteConnections does non-blocking reads from all remote TCP connections
-// and processes any complete messages. Returns packets as (senderAddr, data) pairs.
-func (pr *PacketRelay) readRemoteConnections(ssdpSrc *ssdpSearchSource) {
+// and processes any complete messages.
+func (pr *PacketRelay) readRemoteConnections() {
 	remotes := pr.remoteSockets()
 	if len(remotes) == 0 {
 		return
@@ -1055,6 +1068,11 @@ func (pr *PacketRelay) readRemoteConnections(ssdpSrc *ssdpSearchSource) {
 				}
 				rb.msgLen = int(binary.BigEndian.Uint16(rb.buf[:2]))
 				rb.buf = rb.buf[2:]
+				if rb.msgLen > maxRemoteMessageLen {
+					pr.logger.Warning("REMOTE: Message too large (%d bytes) from %s — closing", rb.msgLen, conn.RemoteAddr())
+					failed = append(failed, conn)
+					break
+				}
 			}
 			if len(rb.buf) < rb.msgLen {
 				break
@@ -1071,7 +1089,7 @@ func (pr *PacketRelay) readRemoteConnections(ssdpSrc *ssdpSearchSource) {
 			}
 
 			// Validate magic bytes + sender IP + at least minimal packet
-			if len(decrypted) < len(magicBytes)+4+28 {
+			if len(decrypted) < len(magicBytes)+4+minUDPPacketLen {
 				pr.logger.Info("REMOTE: Packet too short from %s", conn.RemoteAddr())
 				continue
 			}
@@ -1084,7 +1102,7 @@ func (pr *PacketRelay) readRemoteConnections(ssdpSrc *ssdpSearchSource) {
 			senderAddr := AddrFrom4Bytes(decrypted[4:8]).String()
 			packetData := decrypted[8:]
 
-			pr.processPacket(packetData, senderAddr, "remote", ssdpSrc)
+			pr.processPacket(packetData, senderAddr, "remote")
 		}
 	}
 
@@ -1095,8 +1113,12 @@ func (pr *PacketRelay) readRemoteConnections(ssdpSrc *ssdpSearchSource) {
 	}
 }
 
-// remoteSockets collects all active remote relay connections.
+// remoteSockets returns all active remote relay connections.
+// It rebuilds the cached slice only when connsDirty is true.
 func (pr *PacketRelay) remoteSockets() []net.Conn {
+	if !pr.connsDirty {
+		return pr.connectedRemotes
+	}
 	var conns []net.Conn
 	conns = append(conns, pr.remoteConnections...)
 	for _, ra := range pr.remoteAddrs {
@@ -1104,6 +1126,8 @@ func (pr *PacketRelay) remoteSockets() []net.Conn {
 			conns = append(conns, ra.Conn)
 		}
 	}
+	pr.connectedRemotes = conns
+	pr.connsDirty = false
 	return conns
 }
 
@@ -1127,6 +1151,7 @@ func (pr *PacketRelay) connectRemotes() {
 		}
 		remote.Conn = conn
 		remote.Connecting = false
+		pr.connsDirty = true
 		pr.logger.Info("REMOTE: Connection to %s established", remote.Addr)
 	}
 }
@@ -1134,6 +1159,7 @@ func (pr *PacketRelay) connectRemotes() {
 // removeConnection removes a remote connection from the active set and cleans up its read buffer.
 func (pr *PacketRelay) removeConnection(conn net.Conn) {
 	delete(pr.remoteReadBufs, conn)
+	pr.connsDirty = true
 	for i, c := range pr.remoteConnections {
 		if c == conn {
 			pr.remoteConnections = append(pr.remoteConnections[:i], pr.remoteConnections[i+1:]...)
@@ -1190,7 +1216,34 @@ func interfaceIndex(name string) (int, error) {
 	return iface.Index, nil
 }
 
-// isENXIO checks if an error is the ENXIO errno.
-func isENXIO(err error) bool {
-	return err == unix.ENXIO
+// createTransmitSocket creates and binds an AF_PACKET raw socket for the named interface.
+func createTransmitSocket(ifName string) (int, error) {
+	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, ethPAllBE)
+	if err != nil {
+		return 0, fmt.Errorf("cannot create transmit socket for %s: %w", ifName, err)
+	}
+	ifIndex, err := interfaceIndex(ifName)
+	if err != nil {
+		unix.Close(fd)
+		return 0, fmt.Errorf("cannot get interface index for %s: %w", ifName, err)
+	}
+	sa := &unix.SockaddrLinklayer{
+		Protocol: uint16(ethPAllBE),
+		Ifindex:  ifIndex,
+	}
+	if err := unix.Bind(fd, sa); err != nil {
+		unix.Close(fd)
+		return 0, fmt.Errorf("cannot bind transmit socket to %s: %w", ifName, err)
+	}
+	return fd, nil
+}
+
+// hasUnconnectedRemotes returns true if any remote relay target has no active connection.
+func (pr *PacketRelay) hasUnconnectedRemotes() bool {
+	for _, ra := range pr.remoteAddrs {
+		if ra.Conn == nil {
+			return true
+		}
+	}
+	return false
 }

@@ -171,31 +171,27 @@ func run() int {
 		return 1
 	}
 
+	fatal := func(msg string) int {
+		if *foreground {
+			fmt.Println(msg)
+		} else {
+			log.Warning("%s", msg)
+		}
+		log.Monitor("Process exiting: %s", msg)
+		return 1
+	}
+
 	// Add listeners for each relay address
 	var services []string
 	for _, entry := range relaySet {
 		parts := strings.SplitN(entry.addrPort, ":", 2)
 		if len(parts) != 2 {
-			msg := fmt.Sprintf("%s: Expecting A.B.C.D:P format", entry.addrPort)
-			if *foreground {
-				fmt.Println(msg)
-			} else {
-				log.Warning("%s", msg)
-			}
-			log.Monitor("Process exiting: %s", msg)
-			return 1
+			return fatal(fmt.Sprintf("%s: Expecting A.B.C.D:P format", entry.addrPort))
 		}
 		addr := parts[0]
 		var port int
 		if _, err := fmt.Sscanf(parts[1], "%d", &port); err != nil {
-			msg := fmt.Sprintf("%s: Invalid port number", entry.addrPort)
-			if *foreground {
-				fmt.Println(msg)
-			} else {
-				log.Warning("%s", msg)
-			}
-			log.Monitor("Process exiting: %s", msg)
-			return 1
+			return fatal(fmt.Sprintf("%s: Invalid port number", entry.addrPort))
 		}
 
 		// Validate address type
@@ -207,25 +203,11 @@ func run() int {
 		} else if *ssdpUnicastAddr != "" {
 			relayType = "unicast"
 		} else {
-			msg := fmt.Sprintf("IP address %s is neither a multicast nor a broadcast address", addr)
-			if *foreground {
-				fmt.Println(msg)
-			} else {
-				log.Warning("%s", msg)
-			}
-			log.Monitor("Process exiting: %s", msg)
-			return 1
+			return fatal(fmt.Sprintf("IP address %s is neither a multicast nor a broadcast address", addr))
 		}
 
 		if port < 0 || port > 65535 {
-			msg := fmt.Sprintf("UDP port %d out of range", port)
-			if *foreground {
-				fmt.Println(msg)
-			} else {
-				log.Warning("%s", msg)
-			}
-			log.Monitor("Process exiting: %s", msg)
-			return 1
+			return fatal(fmt.Sprintf("UDP port %d out of range", port))
 		}
 
 		serviceSuffix := ""

@@ -5,8 +5,17 @@ import (
 	"testing"
 )
 
+func mustNew(t *testing.T, key string) *Cipher {
+	t.Helper()
+	c, err := New(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
 func TestCipherDisabled(t *testing.T) {
-	c := New("")
+	c := mustNew(t, "")
 	plaintext := []byte("hello world")
 
 	encrypted, err := c.Encrypt(plaintext)
@@ -34,7 +43,7 @@ func TestCipherDisabled(t *testing.T) {
 }
 
 func TestCipherRoundTrip(t *testing.T) {
-	c := New("mysecretkey")
+	c := mustNew(t, "mysecretkey")
 	plaintext := []byte("The quick brown fox jumps over the lazy dog")
 
 	encrypted, err := c.Encrypt(plaintext)
@@ -61,7 +70,7 @@ func TestCipherRoundTrip(t *testing.T) {
 }
 
 func TestCipherDifferentNonce(t *testing.T) {
-	c := New("testkey")
+	c := mustNew(t, "testkey")
 	plaintext := []byte("same input twice")
 
 	enc1, _ := c.Encrypt(plaintext)
@@ -79,7 +88,7 @@ func TestCipherDifferentNonce(t *testing.T) {
 }
 
 func TestCipherTamperDetection(t *testing.T) {
-	c := New("tamperkey")
+	c := mustNew(t, "tamperkey")
 	plaintext := []byte("sensitive data that must not be tampered with")
 
 	encrypted, err := c.Encrypt(plaintext)
@@ -99,7 +108,7 @@ func TestCipherTamperDetection(t *testing.T) {
 }
 
 func TestCipherTruncatedCiphertext(t *testing.T) {
-	c := New("trunckey")
+	c := mustNew(t, "trunckey")
 
 	// Too short: less than nonce + auth tag
 	short := make([]byte, c.NonceSize()+c.Overhead()-1)
@@ -110,8 +119,8 @@ func TestCipherTruncatedCiphertext(t *testing.T) {
 }
 
 func TestCipherWrongKey(t *testing.T) {
-	c1 := New("key-one")
-	c2 := New("key-two")
+	c1 := mustNew(t, "key-one")
+	c2 := mustNew(t, "key-two")
 	plaintext := []byte("encrypted with key one")
 
 	encrypted, err := c1.Encrypt(plaintext)
@@ -126,7 +135,7 @@ func TestCipherWrongKey(t *testing.T) {
 }
 
 func TestCipherNonceAndOverhead(t *testing.T) {
-	c := New("sizecheck")
+	c := mustNew(t, "sizecheck")
 
 	// Standard GCM: 12-byte nonce, 16-byte auth tag
 	if c.NonceSize() != 12 {

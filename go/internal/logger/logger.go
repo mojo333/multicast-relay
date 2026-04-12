@@ -179,5 +179,8 @@ type syslogWriter struct {
 }
 
 func (s syslogWriter) Write(p []byte) (n int, err error) {
-	return len(p), s.w.Info(string(p))
+	if err := s.w.Info(string(p)); err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }

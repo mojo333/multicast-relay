@@ -3,7 +3,6 @@ package relay
 import (
 	"encoding/binary"
 	"encoding/json"
-	"errors"
 	"net"
 	"net/netip"
 	"os"
@@ -13,8 +12,6 @@ import (
 
 	"github.com/mojo333/multicast-relay/internal/cipher"
 	"github.com/mojo333/multicast-relay/internal/logger"
-
-	"golang.org/x/sys/unix"
 )
 
 func TestIsDuplicate(t *testing.T) {
@@ -359,23 +356,6 @@ func TestGetBufferLargerThanPool(t *testing.T) {
 	putBuffer(bp)
 }
 
-// --- isENXIO tests ---
-
-func TestIsENXIO(t *testing.T) {
-	if !isENXIO(unix.ENXIO) {
-		t.Error("expected isENXIO(unix.ENXIO) = true")
-	}
-	if isENXIO(unix.ENOENT) {
-		t.Error("expected isENXIO(unix.ENOENT) = false")
-	}
-	if isENXIO(errors.New("some error")) {
-		t.Error("expected isENXIO(generic error) = false")
-	}
-	if isENXIO(nil) {
-		t.Error("expected isENXIO(nil) = false")
-	}
-}
-
 // --- isDuplicate checksumCount clamp branch ---
 
 func TestIsDuplicateChecksumCountClamp(t *testing.T) {
@@ -472,12 +452,16 @@ func TestRemoveConnectionFromRemoteAddrs(t *testing.T) {
 
 func TestReadRemoteConnections(t *testing.T) {
 	log := newTestLogger(t)
-	aes := cipher.New("")
+	aes, err := cipher.New("")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	pr := &PacketRelay{
 		logger:         log,
 		aes:            aes,
 		noRemoteRelay:  true, // prevent processPacket from writing back to remotes
+		connsDirty:     true,
 		remoteReadBufs: make(map[net.Conn]*remoteReadBuf),
 	}
 
@@ -524,9 +508,8 @@ func TestReadRemoteConnections(t *testing.T) {
 	// Give the write a moment to complete
 	time.Sleep(50 * time.Millisecond)
 
-	var ssdpSrc ssdpSearchSource
 	// This should read the message without panicking or erroring
-	pr.readRemoteConnections(&ssdpSrc)
+	pr.readRemoteConnections()
 
 	// Verify the read buffer was initialized
 	if _, ok := pr.remoteReadBufs[server]; !ok {
@@ -536,7 +519,10 @@ func TestReadRemoteConnections(t *testing.T) {
 
 func TestReadRemoteConnectionsInvalidMagic(t *testing.T) {
 	log := newTestLogger(t)
-	aes := cipher.New("")
+	aes, err := cipher.New("")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	pr := &PacketRelay{
 		logger:         log,
@@ -566,19 +552,22 @@ func TestReadRemoteConnectionsInvalidMagic(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	var ssdpSrc ssdpSearchSource
 	// Should not panic — just log and skip the invalid message
-	pr.readRemoteConnections(&ssdpSrc)
+	pr.readRemoteConnections()
 }
 
 func TestReadRemoteConnectionsDeadConnection(t *testing.T) {
 	log := newTestLogger(t)
-	aes := cipher.New("")
+	aes, err := cipher.New("")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	pr := &PacketRelay{
 		logger:         log,
 		aes:            aes,
 		noRemoteRelay:  true,
+		connsDirty:     true,
 		remoteReadBufs: make(map[net.Conn]*remoteReadBuf),
 	}
 
@@ -589,8 +578,7 @@ func TestReadRemoteConnectionsDeadConnection(t *testing.T) {
 	// Close the client side to simulate a dead connection
 	client.Close()
 
-	var ssdpSrc ssdpSearchSource
-	pr.readRemoteConnections(&ssdpSrc)
+	pr.readRemoteConnections()
 
 	// The dead connection should have been removed
 	if len(pr.remoteConnections) != 0 {
@@ -622,7 +610,7 @@ func TestCloseSignalsLoop(t *testing.T) {
 }
 
 func TestRemoteSocketsCollectsAll(t *testing.T) {
-	pr := &PacketRelay{}
+	pr := &PacketRelay{connsDirty: true}
 
 	server1, client1 := net.Pipe()
 	defer server1.Close()
