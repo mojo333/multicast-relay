@@ -52,6 +52,9 @@ func checksumFinalize(sum uint32) uint16 {
 // ComputeIPChecksum zeros out the existing checksum field and recomputes the IP header checksum.
 // Modifies data in place and returns the same slice.
 func ComputeIPChecksum(data []byte, ipHeaderLength int) []byte {
+	if ipHeaderLength < 12 || len(data) < ipHeaderLength {
+		return data
+	}
 	data[10] = 0
 	data[11] = 0
 	checksum := NetChecksum(data[:ipHeaderLength])
@@ -62,6 +65,9 @@ func ComputeIPChecksum(data []byte, ipHeaderLength int) []byte {
 // ComputeUDPChecksum computes the UDP checksum using the pseudo-header.
 // Computes incrementally across pseudo-header, UDP header, and data without concatenation.
 func ComputeUDPChecksum(ipHeader, udpHeader, data []byte) []byte {
+	if len(ipHeader) < 20 || len(udpHeader) < 8 {
+		return udpHeader
+	}
 	var sum uint32
 	sum = checksumAdd(sum, ipHeader[12:20])                // src + dst IP
 	sum += uint32(ipHeader[9])                             // protocol
@@ -81,6 +87,9 @@ func ComputeUDPChecksum(ipHeader, udpHeader, data []byte) []byte {
 // ModifyUDPPacket modifies the source/destination address and port of a UDP packet.
 // Pass empty string or 0 to leave the corresponding field unchanged.
 func ModifyUDPPacket(data []byte, ipHeaderLength int, newSrcAddr string, newSrcPort uint16, newDstAddr string, newDstPort uint16) []byte {
+	if ipHeaderLength < 20 || len(data) < ipHeaderLength+8 {
+		return data
+	}
 	srcAddr := net.IP(data[12:16]).To4()
 	dstAddr := net.IP(data[16:20]).To4()
 	srcPort := binary.BigEndian.Uint16(data[ipHeaderLength : ipHeaderLength+2])
@@ -137,6 +146,9 @@ func ModifyUDPPacket(data []byte, ipHeaderLength int, newSrcAddr string, newSrcP
 // MdnsSetUnicastBit sets the UNICAST-RESPONSE bit in mDNS query packets.
 func MdnsSetUnicastBit(data []byte, ipHeaderLength int) []byte {
 	udpDataStart := ipHeaderLength + 8
+	if len(data) < udpDataStart+4 {
+		return data
+	}
 	flags := binary.BigEndian.Uint16(data[udpDataStart+2 : udpDataStart+4])
 	if flags&0x8000 != 0 {
 		return data

@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"os/user"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -60,7 +62,8 @@ func run() int {
 	remotePort := flag.Int("remotePort", 1900, "Port for remote relay communications.")
 	remoteRetry := flag.Int("remoteRetry", 5, "Retry interval (seconds) for failed remote connections.")
 	noRemoteRelay := flag.Bool("noRemoteRelay", false, "Only relay on local interfaces.")
-	aesKey := flag.String("aes", "", "AES encryption key for remote relay connections.")
+	aesKey := flag.String("aes", "", "AES encryption key for remote relay connections (or set MULTICAST_RELAY_AES_KEY env var).")
+	dropUser := flag.String("drop-user", "", "Drop to this unprivileged user after socket setup (Linux only; requires root).")
 	foreground := flag.Bool("foreground", false, "Do not background, log to stdout.")
 	logfile := flag.String("logfile", "", "Save logs to this file.")
 	verbose := flag.Bool("verbose", false, "Enable verbose output.")
@@ -73,6 +76,38 @@ func run() int {
 	// Go's flag package doesn't natively support nargs='+', so we handle trailing args.
 	if flag.NArg() > 0 {
 		interfaces = append(interfaces, flag.Args()...)
+	}
+
+	// AES key: --aes flag takes precedence; fall back to environment variable.
+	aesKeyVal := *aesKey
+	if aesKeyVal == "" {
+		aesKeyVal = os.Getenv("MULTICAST_RELAY_AES_KEY")
+	}
+
+	// Validate interface name specs (name, IP, or CIDR): non-empty, max 100 chars.
+	for _, iface := range interfaces {
+		if err := validateInterfaceSpec(iface); err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid --interfaces value: %s\n", err)
+			return 1
+		}
+	}
+	for _, iface := range masquerade {
+		if err := validateInterfaceSpec(iface); err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid --masquerade value: %s\n", err)
+			return 1
+		}
+	}
+	// Validate listen addresses (must be valid IPs).
+	for _, addr := range listenAddrs {
+		if strings.TrimSpace(addr) == "" {
+			fmt.Fprintln(os.Stderr, "--listen: empty address")
+			return 1
+		}
+	}
+	// Validate remote port range.
+	if *remotePort < 1 || *remotePort > 65535 {
+		fmt.Fprintln(os.Stderr, "--remotePort: must be 1–65535")
+		return 1
 	}
 
 	if len(interfaces) < 2 && !*oneInterface && len(listenAddrs) == 0 && len(remoteAddrs) == 0 {
@@ -159,7 +194,7 @@ func run() int {
 		RemotePort:           *remotePort,
 		RemoteRetry:          *remoteRetry,
 		NoRemoteRelay:        *noRemoteRelay,
-		AESKey:               *aesKey,
+		AESKey:               aesKeyVal,
 		Logger:               log,
 	}
 
@@ -233,6 +268,16 @@ func run() int {
 	log.Monitor("Relay active: interfaces=%v services=[%s]",
 		[]string(interfaces), strings.Join(services, ", "))
 
+	// Drop privileges after all raw sockets are created.
+	if *dropUser != "" {
+		if err := dropPrivileges(*dropUser); err != nil {
+			log.Error("Failed to drop privileges to %q: %s", *dropUser, err)
+			log.Monitor("Process exiting: privilege drop failed: %s", err)
+			return 1
+		}
+		log.Info("Privileges dropped to user %q", *dropUser)
+	}
+
 	// Handle signals for graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -251,6 +296,42 @@ func run() int {
 
 	log.Monitor("Process exiting: clean shutdown")
 	return 0
+}
+
+// validateInterfaceSpec rejects obviously invalid interface specifications before passing them
+// to the kernel. The kernel will reject malformed names, but early validation improves UX.
+func validateInterfaceSpec(spec string) error {
+	if strings.TrimSpace(spec) == "" {
+		return fmt.Errorf("empty interface specification")
+	}
+	if len(spec) > 100 {
+		return fmt.Errorf("interface specification too long: %q", spec)
+	}
+	return nil
+}
+
+// dropPrivileges drops root to the given username after socket setup.
+// Uses syscall.Setuid/Setgid which on Linux (Go 1.16+) applies to all OS threads.
+func dropPrivileges(username string) error {
+	u, err := user.Lookup(username)
+	if err != nil {
+		return fmt.Errorf("user %q not found: %w", username, err)
+	}
+	gid, err := strconv.Atoi(u.Gid)
+	if err != nil {
+		return fmt.Errorf("invalid GID %q for user %q: %w", u.Gid, username, err)
+	}
+	uid, err := strconv.Atoi(u.Uid)
+	if err != nil {
+		return fmt.Errorf("invalid UID %q for user %q: %w", u.Uid, username, err)
+	}
+	if err := syscall.Setgid(gid); err != nil {
+		return fmt.Errorf("setgid(%d): %w", gid, err)
+	}
+	if err := syscall.Setuid(uid); err != nil {
+		return fmt.Errorf("setuid(%d): %w", uid, err)
+	}
+	return nil
 }
 
 // formatArgs returns a string representation of the command-line arguments,
