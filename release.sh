@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO="mojo333/multicast-relay"
-TAG="v2.4"
+TAG="v2.5"
 TARGET="master"
 BINDIR="$(mktemp -d)"
 
@@ -25,21 +25,17 @@ gh release create "${TAG}" \
   --target "${TARGET}" \
   --title "${TAG}" \
   --notes "$(cat <<'EOF'
-## What's Changed since v2.3
+## What's Changed since v2.4
 
-### Code Quality
-- `cipher.New()` now returns `(*Cipher, error)` instead of panicking on bad key input
-- `syslogWriter.Write` correctly propagates errors instead of silently swallowing them
-- `MdnsSetUnicastBit` avoids unnecessary allocation when the unicast bit is already set
-- Extracted `createTransmitSocket` helper to eliminate duplicated socket setup code
-- `remoteSockets()` caches connected-remote slice via `connsDirty` flag to avoid repeated allocations
-- `readRemoteConnections` caps incoming message length to prevent oversized remote frames
-- Decomposed `processPacket` into `applyMDNS`, `handleSSDP`, and `findReceivingIface` helpers
-- Replaced `isENXIO` one-liner wrapper with direct `err == unix.ENXIO` comparison
-- `ssdpSrc` state promoted to `PacketRelay` struct field (was a local variable)
-- Loop receive buffer sized to `maxPacketSize`; `connectRemotes` guarded by `hasUnconnectedRemotes`
-- Package-level `ipv4EtherType` var replaces per-instance struct field
-- `fatal` closure in `main` replaces four duplicated validation-error-exit blocks
+### Performance
+- Replaced all string-based IP address handling with `netip.Addr` throughout the relay package — zero-allocation comparisons, no repeated `net.ParseIP` calls at runtime
+- Added pre-parsed `netip.Addr` constants for well-known multicast addresses (mDNS, SSDP)
+- `EncryptFrame` on `Cipher` combines length-prefix framing and encryption in a single allocation, eliminating a separate `make` + copy on the remote write path
+- Pre-allocated `remoteTmpBuf` read buffer on remote connections avoids per-read heap allocation
+
+### Reliability
+- Remote dial extracted into a dedicated `dialRemote()` goroutine with `connectResultCh` channel — connection attempts no longer block the main relay event loop
+- `InterfaceResult` and `Transmitter` structs updated to carry `netip.Addr`/`netip.Prefix` natively
 
 ## Binaries
 
