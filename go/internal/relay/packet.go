@@ -85,21 +85,21 @@ func ComputeUDPChecksum(ipHeader, udpHeader, data []byte) []byte {
 }
 
 // ModifyUDPPacket modifies the source/destination address and port of a UDP packet.
-// Pass empty string or 0 to leave the corresponding field unchanged.
-func ModifyUDPPacket(data []byte, ipHeaderLength int, newSrcAddr string, newSrcPort uint16, newDstAddr string, newDstPort uint16) []byte {
+// Pass netip.Addr{} or 0 to leave the corresponding field unchanged.
+func ModifyUDPPacket(data []byte, ipHeaderLength int, newSrc netip.Addr, newSrcPort uint16, newDst netip.Addr, newDstPort uint16) []byte {
 	if ipHeaderLength < 20 || len(data) < ipHeaderLength+8 {
 		return data
 	}
-	srcAddr := net.IP(data[12:16]).To4()
-	dstAddr := net.IP(data[16:20]).To4()
+	srcAddrBytes := [4]byte{data[12], data[13], data[14], data[15]}
+	dstAddrBytes := [4]byte{data[16], data[17], data[18], data[19]}
 	srcPort := binary.BigEndian.Uint16(data[ipHeaderLength : ipHeaderLength+2])
 	dstPort := binary.BigEndian.Uint16(data[ipHeaderLength+2 : ipHeaderLength+4])
 
-	if newSrcAddr != "" {
-		srcAddr = net.ParseIP(newSrcAddr).To4()
+	if newSrc.IsValid() {
+		srcAddrBytes = newSrc.As4()
 	}
-	if newDstAddr != "" {
-		dstAddr = net.ParseIP(newDstAddr).To4()
+	if newDst.IsValid() {
+		dstAddrBytes = newDst.As4()
 	}
 	if newSrcPort != 0 {
 		srcPort = newSrcPort
@@ -112,8 +112,8 @@ func ModifyUDPPacket(data []byte, ipHeaderLength int, newSrcAddr string, newSrcP
 	// then src+dst at fixed offsets 12-19, then any IP options (byte 20+).
 	ipHeader := make([]byte, 0, ipHeaderLength)
 	ipHeader = append(ipHeader, data[:12]...)
-	ipHeader = append(ipHeader, srcAddr...)
-	ipHeader = append(ipHeader, dstAddr...)
+	ipHeader = append(ipHeader, srcAddrBytes[:]...)
+	ipHeader = append(ipHeader, dstAddrBytes[:]...)
 	if ipHeaderLength > 20 {
 		ipHeader = append(ipHeader, data[20:ipHeaderLength]...)
 	}
@@ -135,12 +135,8 @@ func ModifyUDPPacket(data []byte, ipHeaderLength int, newSrcAddr string, newSrcP
 
 	newUDPHeader := ComputeUDPChecksum(fullPacket[:ipHeaderLength], fullPacket[ipHeaderLength:ipHeaderLength+8], udpData)
 
-	result := make([]byte, 0, len(fullPacket))
-	result = append(result, fullPacket[:ipHeaderLength]...)
-	result = append(result, newUDPHeader...)
-	result = append(result, udpData...)
-
-	return result
+	copy(fullPacket[ipHeaderLength:ipHeaderLength+8], newUDPHeader)
+	return fullPacket
 }
 
 // MdnsSetUnicastBit sets the UNICAST-RESPONSE bit in mDNS query packets.
@@ -237,21 +233,14 @@ func Long2IP(ip uint32) string {
 	return netip.AddrFrom4(b).String()
 }
 
-// OnNetwork checks if an IP is on the given network/netmask (string-based API for backward compat).
-func OnNetwork(ip, network, netmask string) bool {
-	ipL := IP2Long(ip)
-	networkL := IP2Long(network)
-	netmaskL := IP2Long(netmask)
-	return (ipL & netmaskL) == (networkL & netmaskL)
+// OnNetwork checks if an IP address is within a network prefix.
+func OnNetwork(ip netip.Addr, network netip.Prefix) bool {
+	return network.Contains(ip)
 }
 
 // OnNetworkPrefix checks if an IP address is within a netip.Prefix.
-func OnNetworkPrefix(ip string, prefix netip.Prefix) bool {
-	addr, err := netip.ParseAddr(ip)
-	if err != nil {
-		return false
-	}
-	return prefix.Contains(addr)
+func OnNetworkPrefix(ip netip.Addr, prefix netip.Prefix) bool {
+	return prefix.Contains(ip)
 }
 
 // CIDRToNetmask converts CIDR prefix bits to a dotted-quad netmask string.

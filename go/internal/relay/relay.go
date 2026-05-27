@@ -52,6 +52,9 @@ var (
 
 	ssdpSearchRe = regexp.MustCompile(`M-SEARCH|NOTIFY`)
 
+	ssdpMcastNetip = netip.MustParseAddr(SSDPMcastAddr)
+	mdnsMcastNetip = netip.MustParseAddr(MDNSMcastAddr)
+
 	// packetPool provides reusable byte buffers for packet processing.
 	packetPool = sync.Pool{
 		New: func() interface{} {
@@ -95,10 +98,18 @@ func New(cfg Config) (*PacketRelay, error) {
 		return nil, err
 	}
 
+	var ssdpUnicast netip.Addr
+	if cfg.SSDPUnicastAddr != "" {
+		ssdpUnicast, err = netip.ParseAddr(cfg.SSDPUnicastAddr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid ssdp-unicast-addr %q: %w", cfg.SSDPUnicastAddr, err)
+		}
+	}
+
 	pr := &PacketRelay{
 		interfaces:           cfg.Interfaces,
 		noTransmitInterfaces: noTx,
-		ssdpUnicastAddr:      cfg.SSDPUnicastAddr,
+		ssdpUnicastAddr:      ssdpUnicast,
 		mdnsForceUnicast:     cfg.MDNSForceUnicast,
 		wait:                 cfg.WaitForIP,
 		ttl:                  cfg.TTL,
@@ -106,7 +117,7 @@ func New(cfg Config) (*PacketRelay, error) {
 		allowNonEther:        cfg.AllowNonEther,
 		masquerade:           masq,
 		logger:               cfg.Logger,
-		etherAddrs:           make(map[string]net.HardwareAddr),
+		etherAddrs:           make(map[netip.Addr]net.HardwareAddr),
 		remoteReadBufs:       make(map[net.Conn]*remoteReadBuf),
 		listenAddr:           cfg.Listen,
 		remotePort:           cfg.RemotePort,
@@ -116,6 +127,17 @@ func New(cfg Config) (*PacketRelay, error) {
 		connsDirty:           true,
 		pollDirty:            true,
 		done:                 make(chan struct{}),
+		remoteTmpBuf:         make([]byte, 4096),
+	}
+
+	if cfg.Remote != nil {
+		for _, addr := range cfg.Remote {
+			pr.remoteAddrs = append(pr.remoteAddrs, &RemoteAddr{Addr: addr})
+		}
+	}
+
+	if len(pr.remoteAddrs) > 0 || len(cfg.Listen) > 0 {
+		pr.connectResultCh = make(chan connectResult, 8)
 	}
 
 	if cfg.IfFilter != "" {
@@ -124,12 +146,6 @@ func New(cfg Config) (*PacketRelay, error) {
 			return nil, err
 		}
 		pr.parsedFilters = rawFilters
-	}
-
-	if cfg.Remote != nil {
-		for _, addr := range cfg.Remote {
-			pr.remoteAddrs = append(pr.remoteAddrs, &RemoteAddr{Addr: addr})
-		}
 	}
 
 	// Set up listen socket if in server mode
@@ -142,8 +158,6 @@ func New(cfg Config) (*PacketRelay, error) {
 		pr.listener = ln
 		pr.acceptCh = make(chan net.Conn, 8)
 		go pr.acceptLoop()
-	} else if len(pr.remoteAddrs) > 0 {
-		pr.connectRemotes()
 	}
 
 	return pr, nil
@@ -213,66 +227,60 @@ func (pr *PacketRelay) Close() {
 }
 
 // processPacket processes an incoming packet and relays it to other interfaces.
-func (pr *PacketRelay) processPacket(data []byte, senderAddr string, receivingInterface string) {
+func (pr *PacketRelay) processPacket(data []byte, senderAddr netip.Addr, receivingInterface string) {
 	if len(data) < minUDPPacketLen {
 		return
 	}
 
-	// Forward to remote connections
-	remotes := pr.remoteSockets()
-	if len(remotes) > 0 && !(receivingInterface == "remote" && pr.noRemoteRelay) {
-		senderIP := net.ParseIP(senderAddr).To4()
-		if senderIP != nil {
-			// Build packet without mutating magicBytes
-			packet := make([]byte, 0, len(magicBytes)+4+len(data))
-			packet = append(packet, magicBytes[:]...)
-			packet = append(packet, senderIP...)
-			packet = append(packet, data...)
-
-			encrypted, err := pr.aes.Encrypt(packet)
-			if err == nil {
-				payload := make([]byte, 2+len(encrypted))
-				binary.BigEndian.PutUint16(payload[0:2], uint16(len(encrypted)))
-				copy(payload[2:], encrypted)
-
-				var failed []net.Conn
-				for _, conn := range remotes {
-					conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
-					_, werr := conn.Write(payload)
-					conn.SetWriteDeadline(time.Time{})
-					if werr != nil {
-						pr.logger.Warning("REMOTE: Write error to %s: %s", conn.RemoteAddr(), werr)
-						failed = append(failed, conn)
-					}
-				}
-				for _, conn := range failed {
-					pr.removeConnection(conn)
-					conn.Close()
-				}
-			}
-		}
-	}
-
-	// Extract TTL
-	ttl := data[8]
-	if pr.ttl > 0 {
-		data[8] = byte(pr.ttl)
-	}
-
-	// Duplicate detection via IP checksum
+	// Dedup check FIRST using the original received checksum, before any modification.
 	ipChecksum := binary.BigEndian.Uint16(data[10:12])
 	if pr.isDuplicate(ipChecksum) {
 		return
 	}
-
-	srcAddr := AddrFrom4Bytes(data[12:16]).String()
-	dstAddr := AddrFrom4Bytes(data[16:20]).String()
+	pr.addChecksum(ipChecksum)
 
 	// IP header length
 	ipHeaderLength := int(data[0]&0x0f) * 4
 	if ipHeaderLength < 20 || ipHeaderLength > len(data)-8 {
 		return
 	}
+
+	// Forward to remote connections with original TTL (before local TTL rewrite).
+	remotes := pr.remoteSockets()
+	if len(remotes) > 0 && !(receivingInterface == "remote" && pr.noRemoteRelay) {
+		senderIPBytes := senderAddr.As4()
+		packet := make([]byte, 0, len(magicBytes)+4+len(data))
+		packet = append(packet, magicBytes[:]...)
+		packet = append(packet, senderIPBytes[:]...)
+		packet = append(packet, data...)
+
+		frame, err := pr.aes.EncryptFrame(packet)
+		if err == nil {
+			var failed []net.Conn
+			for _, conn := range remotes {
+				conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+				_, werr := conn.Write(frame)
+				conn.SetWriteDeadline(time.Time{})
+				if werr != nil {
+					pr.logger.Warning("REMOTE: Write error to %s: %s", conn.RemoteAddr(), werr)
+					failed = append(failed, conn)
+				}
+			}
+			for _, conn := range failed {
+				pr.removeConnection(conn)
+				conn.Close()
+			}
+		}
+	}
+
+	// Extract TTL for logging, then apply local TTL override.
+	ttl := data[8]
+	if pr.ttl > 0 {
+		data[8] = byte(pr.ttl)
+	}
+
+	srcAddr := AddrFrom4Bytes(data[12:16])
+	dstAddr := AddrFrom4Bytes(data[16:20])
 	srcPort := binary.BigEndian.Uint16(data[ipHeaderLength : ipHeaderLength+2])
 	dstPort := binary.BigEndian.Uint16(data[ipHeaderLength+2 : ipHeaderLength+4])
 
@@ -315,12 +323,12 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr string, receivingIn
 
 		if broadcastPacket {
 			localDstAddr = tx.Broadcast
-			localDestMac = pr.etherAddrs[BroadcastAddr]
+			localDestMac = pr.etherAddrs[broadcastIP]
 			localOrigDstAddr = tx.Broadcast
 		}
 
 		if localOrigDstAddr == tx.Relay.Addr && int(origDstPort) == tx.Relay.Port &&
-			(pr.oneInterface || !OnNetwork(senderAddr, tx.Addr, tx.Netmask)) {
+			(pr.oneInterface || !OnNetwork(senderAddr, tx.Network)) {
 
 			if localDestMac == nil {
 				localDestMac = pr.etherAddrs[localDstAddr]
@@ -335,7 +343,8 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr string, receivingIn
 
 			isMasq := pr.masquerade[tx.Interface]
 			if isMasq {
-				copy(txData[12:16], net.ParseIP(tx.Addr).To4())
+				addrBytes := tx.Addr.As4()
+				copy(txData[12:16], addrBytes[:])
 			}
 
 			servicePrefix := ""
@@ -369,8 +378,8 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr string, receivingIn
 }
 
 // applyMDNS sets the UNICAST-RESPONSE bit in mDNS query packets when mdnsForceUnicast is enabled.
-func (pr *PacketRelay) applyMDNS(data []byte, ipHeaderLength int, dstAddr string, dstPort uint16) []byte {
-	if pr.mdnsForceUnicast && dstAddr == MDNSMcastAddr && dstPort == MDNSMcastPort {
+func (pr *PacketRelay) applyMDNS(data []byte, ipHeaderLength int, dstAddr netip.Addr, dstPort uint16) []byte {
+	if pr.mdnsForceUnicast && dstAddr == mdnsMcastNetip && dstPort == MDNSMcastPort {
 		return MdnsSetUnicastBit(data, ipHeaderLength)
 	}
 	return data
@@ -379,10 +388,10 @@ func (pr *PacketRelay) applyMDNS(data []byte, ipHeaderLength int, dstAddr string
 // handleSSDP processes SSDP M-SEARCH interception and unicast reply routing.
 // It may modify srcAddr/srcPort (M-SEARCH), dstAddr/dstPort (unicast reply), data, and destMac.
 // Returns drop=true when the packet should be silently discarded.
-func (pr *PacketRelay) handleSSDP(data []byte, ipHeaderLength int, srcAddr string, srcPort uint16, dstAddr string, dstPort uint16) (outData []byte, outSrcAddr string, outSrcPort uint16, outDstAddr string, outDstPort uint16, destMac net.HardwareAddr, drop bool) {
+func (pr *PacketRelay) handleSSDP(data []byte, ipHeaderLength int, srcAddr netip.Addr, srcPort uint16, dstAddr netip.Addr, dstPort uint16) (outData []byte, outSrcAddr netip.Addr, outSrcPort uint16, outDstAddr netip.Addr, outDstPort uint16, destMac net.HardwareAddr, drop bool) {
 	outData, outSrcAddr, outSrcPort, outDstAddr, outDstPort = data, srcAddr, srcPort, dstAddr, dstPort
 
-	if pr.ssdpUnicastAddr != "" && dstAddr == SSDPMcastAddr && dstPort == SSDPMcastPort && ssdpSearchRe.Match(data[ipHeaderLength+8:]) {
+	if pr.ssdpUnicastAddr.IsValid() && dstAddr == ssdpMcastNetip && dstPort == SSDPMcastPort && ssdpSearchRe.Match(data[ipHeaderLength+8:]) {
 		pr.ssdpSrc.addr = srcAddr
 		pr.ssdpSrc.port = srcPort
 		pr.ssdpSrc.set = true
@@ -390,11 +399,11 @@ func (pr *PacketRelay) handleSSDP(data []byte, ipHeaderLength int, srcAddr strin
 
 		outSrcAddr = pr.ssdpUnicastAddr
 		outSrcPort = SSDPUnicastPort
-		outData = ModifyUDPPacket(data, ipHeaderLength, outSrcAddr, outSrcPort, "", 0)
+		outData = ModifyUDPPacket(data, ipHeaderLength, outSrcAddr, outSrcPort, netip.Addr{}, 0)
 		return
 	}
 
-	if pr.ssdpUnicastAddr != "" && dstAddr == pr.ssdpUnicastAddr && dstPort == SSDPUnicastPort {
+	if pr.ssdpUnicastAddr.IsValid() && dstAddr == pr.ssdpUnicastAddr && dstPort == SSDPUnicastPort {
 		if !pr.ssdpSrc.set {
 			drop = true
 			return
@@ -404,9 +413,9 @@ func (pr *PacketRelay) handleSSDP(data []byte, ipHeaderLength int, srcAddr strin
 		pr.logger.Info("Received SSDP Unicast - received from %s:%d on %s:%d, need to relay to %s:%d",
 			srcAddr, srcPort, dstAddr, dstPort, outDstAddr, outDstPort)
 
-		outData = ModifyUDPPacket(data, ipHeaderLength, "", 0, outDstAddr, outDstPort)
+		outData = ModifyUDPPacket(data, ipHeaderLength, netip.Addr{}, 0, outDstAddr, outDstPort)
 
-		macStr, err := UnicastIPToMAC(outDstAddr, "")
+		macStr, err := UnicastIPToMAC(outDstAddr.String(), "")
 		if err != nil || macStr == "" {
 			pr.logger.Info("Could not resolve MAC for %s", outDstAddr)
 			drop = true
@@ -423,12 +432,13 @@ func (pr *PacketRelay) handleSSDP(data []byte, ipHeaderLength int, srcAddr strin
 }
 
 // findReceivingIface identifies which local interface received a packet based on destination.
-func (pr *PacketRelay) findReceivingIface(senderAddr, origDstAddr string, origDstPort uint16) (ifaceName string, isBroadcast bool) {
+func (pr *PacketRelay) findReceivingIface(senderAddr, origDstAddr netip.Addr, origDstPort uint16) (ifaceName string, isBroadcast bool) {
 	for _, tx := range pr.transmitters {
 		if origDstAddr == tx.Relay.Addr && int(origDstPort) == tx.Relay.Port &&
-			OnNetwork(senderAddr, tx.Addr, tx.Netmask) {
+			OnNetwork(senderAddr, tx.Network) {
 			ifaceName = tx.Interface
 			isBroadcast = (origDstAddr == tx.Broadcast)
+			break
 		}
 	}
 	return
@@ -460,7 +470,7 @@ func (pr *PacketRelay) addChecksum(checksum uint16) {
 }
 
 // isAllowedByFilter checks the pre-parsed ifFilter rules.
-func (pr *PacketRelay) isAllowedByFilter(srcAddr, txInterface string) bool {
+func (pr *PacketRelay) isAllowedByFilter(srcAddr netip.Addr, txInterface string) bool {
 	for _, f := range pr.parsedFilters {
 		if OnNetworkPrefix(srcAddr, f.prefix) {
 			for _, iface := range f.ifaces {

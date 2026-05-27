@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"bytes"
 	"net"
 	"net/netip"
 	"time"
@@ -11,9 +12,16 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// remoteReadBuf holds per-connection read state for remote TCP relay connections.
+type remoteReadBuf struct {
+	buf        bytes.Buffer
+	msgLen     int
+	lastActive time.Time
+}
+
 // ssdpSearchSource tracks the most recent SSDP search source for unicast reply routing.
 type ssdpSearchSource struct {
-	addr string
+	addr netip.Addr
 	port uint16
 	set  bool
 }
@@ -26,7 +34,7 @@ type parsedFilter struct {
 
 // RelayAddr stores a multicast/broadcast address and port pair.
 type RelayAddr struct {
-	Addr string
+	Addr netip.Addr
 	Port int
 }
 
@@ -34,17 +42,24 @@ type RelayAddr struct {
 type Transmitter struct {
 	Relay     RelayAddr
 	Interface string
-	Addr      string
+	Addr      netip.Addr       // interface IP address
 	MAC       net.HardwareAddr
-	Netmask   string
-	Broadcast string
-	Socket    int // raw AF_PACKET socket fd
+	Network   netip.Prefix     // interface network prefix, replaces Netmask string
+	Broadcast netip.Addr       // interface broadcast address
+	Socket    int              // raw AF_PACKET socket fd
 	Service   string
 }
 
 // Receiver wraps a raw receive socket fd.
 type Receiver struct {
 	fd int
+}
+
+// connectResult carries the outcome of an async remote dial attempt.
+type connectResult struct {
+	ra   *RemoteAddr
+	conn net.Conn
+	err  error
 }
 
 // RemoteAddr holds state for a remote relay connection target.
@@ -81,7 +96,7 @@ type PacketRelay struct {
 	interfaces           []string
 	noTransmitInterfaces map[string]bool
 	parsedFilters        []parsedFilter
-	ssdpUnicastAddr      string
+	ssdpUnicastAddr      netip.Addr // zero value means disabled
 	mdnsForceUnicast     bool
 	wait                 bool
 	ttl                  int
@@ -93,7 +108,7 @@ type PacketRelay struct {
 
 	transmitters []Transmitter
 	receivers    []Receiver
-	etherAddrs   map[string]net.HardwareAddr
+	etherAddrs   map[netip.Addr]net.HardwareAddr // multicast/broadcast IP → MAC
 
 	// ssdpSrc tracks the most recent SSDP M-SEARCH source for unicast reply routing.
 	// Only accessed from the single-threaded main loop.
@@ -105,10 +120,11 @@ type PacketRelay struct {
 	checksumIdx     int
 	checksumCount   int
 
-	listenAddr        []string
-	listener          *net.TCPListener
-	acceptCh          chan net.Conn
-	remoteAddrs       []*RemoteAddr
+	listenAddr      []string
+	listener        *net.TCPListener
+	acceptCh        chan net.Conn
+	connectResultCh chan connectResult // receives async dial outcomes
+	remoteAddrs     []*RemoteAddr
 	remotePort        int
 	remoteRetry       int
 	noRemoteRelay     bool
@@ -117,6 +133,9 @@ type PacketRelay struct {
 	connectedRemotes  []net.Conn // cached union of all active remote connections
 	connsDirty        bool       // true when connectedRemotes needs rebuilding
 	remoteReadBufs    map[net.Conn]*remoteReadBuf
+
+	// remoteTmpBuf is a pre-allocated read buffer for remote TCP connection reads.
+	remoteTmpBuf []byte
 
 	// Pre-allocated poll structures rebuilt when receivers change.
 	pollFds   []unix.PollFd

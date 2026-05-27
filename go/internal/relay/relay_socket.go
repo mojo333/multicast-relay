@@ -13,12 +13,16 @@ import (
 
 // AddListener sets up receive and transmit sockets for a relay address.
 func (pr *PacketRelay) AddListener(addr string, port int, service string) error {
+	addrN, err := netip.ParseAddr(addr)
+	if err != nil {
+		return fmt.Errorf("invalid relay address %q: %w", addr, err)
+	}
 	if IsBroadcast(addr) {
-		pr.etherAddrs[addr] = BroadcastIPToMAC()
+		pr.etherAddrs[addrN] = BroadcastIPToMAC()
 	} else if IsMulticast(addr) {
-		pr.etherAddrs[addr] = MulticastIPToMAC(addr)
+		pr.etherAddrs[addrN] = MulticastIPToMAC(addr)
 	} else {
-		pr.etherAddrs[addr] = nil
+		pr.etherAddrs[addrN] = nil
 	}
 
 	var multicastRxFd int = -1
@@ -55,9 +59,8 @@ func (pr *PacketRelay) AddListener(addr string, port int, service string) error 
 				return fmt.Errorf("cannot set SO_BROADCAST: %w", err)
 			}
 
-			bcastIP := net.ParseIP(ifInfo.Broadcast).To4()
-			sa := &unix.SockaddrInet4{Port: port}
-			copy(sa.Addr[:], bcastIP)
+			bcastBytes := ifInfo.Broadcast.As4()
+			sa := &unix.SockaddrInet4{Port: port, Addr: bcastBytes}
 			if err := unix.Bind(fd, sa); err != nil {
 				unix.Close(fd)
 				return fmt.Errorf("cannot bind broadcast socket to %s:%d: %w", ifInfo.Broadcast, port, err)
@@ -66,10 +69,10 @@ func (pr *PacketRelay) AddListener(addr string, port int, service string) error 
 
 		} else if IsMulticast(addr) {
 			mcastIP := net.ParseIP(addr).To4()
-			ifIP := net.ParseIP(ifInfo.IP).To4()
+			ifIPBytes := ifInfo.Addr.As4()
 			mreq := &unix.IPMreq{}
 			copy(mreq.Multiaddr[:], mcastIP)
-			copy(mreq.Interface[:], ifIP)
+			copy(mreq.Interface[:], ifIPBytes[:])
 			if err := unix.SetsockoptIPMreq(multicastRxFd, unix.SOL_IP, unix.IP_ADD_MEMBERSHIP, mreq); err != nil {
 				return fmt.Errorf("cannot join multicast group %s on %s: %w", addr, ifInfo.Name, err)
 			}
@@ -82,17 +85,17 @@ func (pr *PacketRelay) AddListener(addr string, port int, service string) error 
 				return err
 			}
 
-			listenIP := addr
+			listenNetip := addrN
 			if IsBroadcast(addr) {
-				listenIP = ifInfo.Broadcast
+				listenNetip = ifInfo.Broadcast
 			}
 
 			pr.transmitters = append(pr.transmitters, Transmitter{
-				Relay:     RelayAddr{Addr: listenIP, Port: port},
+				Relay:     RelayAddr{Addr: listenNetip, Port: port},
 				Interface: ifInfo.Name,
-				Addr:      ifInfo.IP,
+				Addr:      ifInfo.Addr,
 				MAC:       ifInfo.MAC,
-				Netmask:   ifInfo.Netmask,
+				Network:   ifInfo.Network,
 				Broadcast: ifInfo.Broadcast,
 				Socket:    txFd,
 				Service:   service,
@@ -130,9 +133,9 @@ func (pr *PacketRelay) rebuildPollFds() {
 type InterfaceResult struct {
 	Name      string
 	MAC       net.HardwareAddr
-	IP        string
-	Netmask   string
-	Broadcast string
+	Addr      netip.Addr
+	Network   netip.Prefix
+	Broadcast netip.Addr
 }
 
 // resolveInterface does a single pass over all system interfaces to find one
@@ -190,12 +193,14 @@ func resolveInterface(spec string) (*InterfaceResult, error) {
 			var bcastBytes [4]byte
 			binary.BigEndian.PutUint32(bcastBytes[:], bcastInt)
 
+			ones, _ := net.IPMask(mask).Size()
+
 			return &InterfaceResult{
 				Name:      iface.Name,
 				MAC:       iface.HardwareAddr,
-				IP:        ifAddr.String(),
-				Netmask:   fmt.Sprintf("%d.%d.%d.%d", mask[0], mask[1], mask[2], mask[3]),
-				Broadcast: netip.AddrFrom4(bcastBytes).String(),
+				Addr:      ifAddr,
+				Network:   netip.PrefixFrom(ifAddr, ones).Masked(),
+				Broadcast: netip.AddrFrom4(bcastBytes),
 			}, nil
 		}
 	}
@@ -211,7 +216,7 @@ func (pr *PacketRelay) getInterface(iface string) (*InterfaceResult, error) {
 	}
 
 	// Wait for IPv4 address if configured
-	if pr.wait && result.IP == "" {
+	if pr.wait && !result.Addr.IsValid() {
 		for {
 			pr.logger.Info("Waiting for IPv4 address on %s", result.Name)
 			time.Sleep(time.Second)
@@ -219,13 +224,13 @@ func (pr *PacketRelay) getInterface(iface string) (*InterfaceResult, error) {
 			if err != nil {
 				return nil, err
 			}
-			if result.IP != "" {
+			if result.Addr.IsValid() {
 				break
 			}
 		}
 	}
 
-	if result.IP == "" {
+	if !result.Addr.IsValid() {
 		return nil, fmt.Errorf("interface %s does not have an IPv4 address assigned", iface)
 	}
 
@@ -256,8 +261,8 @@ func (pr *PacketRelay) recoverTransmitter(tx *Transmitter, destMac net.HardwareA
 	unix.Close(tx.Socket)
 	tx.Socket = newFd
 	tx.MAC = ifInfo.MAC
-	tx.Netmask = ifInfo.Netmask
-	tx.Addr = ifInfo.IP
+	tx.Network = ifInfo.Network
+	tx.Addr = ifInfo.Addr
 	if err := pr.transmitPacket(tx, destMac, ipHeaderLength, data); err != nil {
 		pr.logger.Warning("Recovery retransmit failed for %s: %s", tx.Interface, err)
 	}
@@ -323,10 +328,6 @@ func (pr *PacketRelay) transmitPacket(tx *Transmitter, destMac net.HardwareAddr,
 
 		ipPacket := scratch[etherOff : etherOff+totalLength]
 		ComputeIPChecksum(ipPacket, ipHeaderLength)
-
-		// Track checksum for duplicate detection
-		cs := binary.BigEndian.Uint16(ipPacket[10:12])
-		pr.addChecksum(cs)
 
 		var frame []byte
 		if hasEther {

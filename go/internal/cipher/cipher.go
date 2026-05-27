@@ -7,6 +7,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -107,6 +108,28 @@ func (c *Cipher) Encrypt(plaintext []byte) ([]byte, error) {
 
 	// Seal appends the ciphertext+tag to nonce
 	return c.gcm.Seal(nonce, nonce, plaintext, nil), nil
+}
+
+// EncryptFrame encrypts plaintext and returns a single wire frame in one allocation:
+// [2-byte big-endian length][nonce(12)][ciphertext+tag] when AES is enabled,
+// or [2-byte length][plaintext] when AES is disabled.
+func (c *Cipher) EncryptFrame(plaintext []byte) ([]byte, error) {
+	if !c.enabled {
+		frame := make([]byte, 2+len(plaintext))
+		binary.BigEndian.PutUint16(frame[0:2], uint16(len(plaintext)))
+		copy(frame[2:], plaintext)
+		return frame, nil
+	}
+	ns := c.gcm.NonceSize()
+	// Pre-allocate: 2-byte length prefix + nonce + plaintext + GCM tag.
+	frame := make([]byte, 2+ns, 2+ns+len(plaintext)+c.gcm.Overhead())
+	if _, err := io.ReadFull(rand.Reader, frame[2:2+ns]); err != nil {
+		return nil, err
+	}
+	nonce := frame[2 : 2+ns]
+	sealed := c.gcm.Seal(frame, nonce, plaintext, nil)
+	binary.BigEndian.PutUint16(sealed[0:2], uint16(len(sealed)-2))
+	return sealed, nil
 }
 
 // Decrypt decrypts and verifies ciphertext using AES-256-GCM.

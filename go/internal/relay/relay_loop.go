@@ -7,6 +7,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+
 // Loop runs the main packet relay event loop.
 func (pr *PacketRelay) Loop() error {
 	buf := make([]byte, maxPacketSize)
@@ -31,7 +32,28 @@ func (pr *PacketRelay) Loop() error {
 			continue
 		}
 
-		// Drain accepted connections (non-blocking)
+		// Drain async dial results (non-blocking).
+		if pr.connectResultCh != nil {
+		drainConnect:
+			for {
+				select {
+				case result := <-pr.connectResultCh:
+					result.ra.Connecting = false
+					if result.err != nil {
+						result.ra.ConnectFailure = time.Now()
+						pr.logger.Warning("REMOTE: Failed to connect to %s: %s", result.ra.Addr, result.err)
+					} else {
+						result.ra.Conn = result.conn
+						pr.connsDirty = true
+						pr.logger.Info("REMOTE: Connection to %s established", result.ra.Addr)
+					}
+				default:
+					break drainConnect
+				}
+			}
+		}
+
+		// Drain accepted connections (non-blocking).
 		if pr.acceptCh != nil {
 		drainAccept:
 			for {
@@ -88,7 +110,7 @@ func (pr *PacketRelay) Loop() error {
 				putBuffer(dataBp)
 				continue
 			}
-			senderAddr := AddrFrom4Bytes(sa.Addr[:]).String()
+			senderAddr := AddrFrom4Bytes(sa.Addr[:])
 
 			pr.processPacket(*dataBp, senderAddr, "local")
 			putBuffer(dataBp)

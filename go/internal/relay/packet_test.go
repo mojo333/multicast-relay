@@ -216,7 +216,7 @@ func TestModifyUDPPacket(t *testing.T) {
 	}
 
 	t.Run("no changes", func(t *testing.T) {
-		result := ModifyUDPPacket(dnsQuery, 20, "", 0, "", 0)
+		result := ModifyUDPPacket(dnsQuery, 20, netip.Addr{}, 0, netip.Addr{}, 0)
 		if len(result) != len(dnsQuery) {
 			t.Fatalf("length mismatch: got %d, want %d", len(result), len(dnsQuery))
 		}
@@ -229,7 +229,7 @@ func TestModifyUDPPacket(t *testing.T) {
 	})
 
 	t.Run("change IPs and ports", func(t *testing.T) {
-		result := ModifyUDPPacket(dnsQuery, 20, "192.168.1.196", 57054, "91.189.91.157", 308)
+		result := ModifyUDPPacket(dnsQuery, 20, netip.MustParseAddr("192.168.1.196"), 57054, netip.MustParseAddr("91.189.91.157"), 308)
 		// Verify new source IP at bytes 12-15
 		if result[12] != 0xc0 || result[13] != 0xa8 || result[14] != 0x01 || result[15] != 0xc4 {
 			t.Errorf("source IP mismatch: got %v", result[12:16])
@@ -267,7 +267,7 @@ func TestModifyUDPPacket(t *testing.T) {
 	}
 
 	t.Run("SSDP no changes", func(t *testing.T) {
-		result := ModifyUDPPacket(ssdpQuery, 20, "", 0, "", 0)
+		result := ModifyUDPPacket(ssdpQuery, 20, netip.Addr{}, 0, netip.Addr{}, 0)
 		if len(result) != len(ssdpQuery) {
 			t.Fatalf("length mismatch: got %d, want %d", len(result), len(ssdpQuery))
 		}
@@ -280,7 +280,7 @@ func TestModifyUDPPacket(t *testing.T) {
 	})
 
 	t.Run("SSDP change src only", func(t *testing.T) {
-		result := ModifyUDPPacket(ssdpQuery, 20, "10.0.0.1", 1901, "", 0)
+		result := ModifyUDPPacket(ssdpQuery, 20, netip.MustParseAddr("10.0.0.1"), 1901, netip.Addr{}, 0)
 		// Check source IP is now 10.0.0.1
 		if result[12] != 0x0a || result[13] != 0x00 || result[14] != 0x00 || result[15] != 0x01 {
 			t.Errorf("source IP mismatch: got %v", result[12:16])
@@ -319,7 +319,7 @@ func TestModifyUDPPacketWithIPOptions(t *testing.T) {
 	pkt = append(pkt, udpData...)
 
 	t.Run("preserves IP options when changing addresses", func(t *testing.T) {
-		result := ModifyUDPPacket(pkt, 24, "10.0.0.1", 5678, "10.0.0.2", 80)
+		result := ModifyUDPPacket(pkt, 24, netip.MustParseAddr("10.0.0.1"), 5678, netip.MustParseAddr("10.0.0.2"), 80)
 
 		// Verify IHL is preserved
 		if result[0] != 0x46 {
@@ -363,7 +363,7 @@ func TestModifyUDPPacketWithIPOptions(t *testing.T) {
 	})
 
 	t.Run("no changes preserves options", func(t *testing.T) {
-		result := ModifyUDPPacket(pkt, 24, "", 0, "", 0)
+		result := ModifyUDPPacket(pkt, 24, netip.Addr{}, 0, netip.Addr{}, 0)
 
 		// IP options should still be intact
 		if result[20] != 0x01 || result[21] != 0x02 || result[22] != 0x03 || result[23] != 0x04 {
@@ -441,19 +441,20 @@ func TestMulticastIPToMAC(t *testing.T) {
 
 func TestOnNetwork(t *testing.T) {
 	tests := []struct {
-		ip, network, netmask string
-		expected             bool
+		ip       netip.Addr
+		network  netip.Prefix
+		expected bool
 	}{
-		{"192.168.1.100", "192.168.1.0", "255.255.255.0", true},
-		{"192.168.2.100", "192.168.1.0", "255.255.255.0", false},
-		{"10.0.0.5", "10.0.0.0", "255.255.255.0", true},
-		{"10.0.1.5", "10.0.0.0", "255.255.255.0", false},
-		{"10.0.1.5", "10.0.0.0", "255.255.0.0", true},
+		{netip.MustParseAddr("192.168.1.100"), netip.MustParsePrefix("192.168.1.0/24"), true},
+		{netip.MustParseAddr("192.168.2.100"), netip.MustParsePrefix("192.168.1.0/24"), false},
+		{netip.MustParseAddr("10.0.0.5"), netip.MustParsePrefix("10.0.0.0/24"), true},
+		{netip.MustParseAddr("10.0.1.5"), netip.MustParsePrefix("10.0.0.0/24"), false},
+		{netip.MustParseAddr("10.0.1.5"), netip.MustParsePrefix("10.0.0.0/16"), true},
 	}
 	for _, tt := range tests {
-		got := OnNetwork(tt.ip, tt.network, tt.netmask)
+		got := OnNetwork(tt.ip, tt.network)
 		if got != tt.expected {
-			t.Errorf("OnNetwork(%s, %s, %s) = %v, want %v", tt.ip, tt.network, tt.netmask, got, tt.expected)
+			t.Errorf("OnNetwork(%s, %s) = %v, want %v", tt.ip, tt.network, got, tt.expected)
 		}
 	}
 }
@@ -677,20 +678,19 @@ func TestOnNetworkPrefix(t *testing.T) {
 	prefix := netip.MustParsePrefix("192.168.1.0/24")
 	tests := []struct {
 		name     string
-		ip       string
+		ip       netip.Addr
 		expected bool
 	}{
-		{"in range", "192.168.1.100", true},
-		{"network address", "192.168.1.0", true},
-		{"broadcast", "192.168.1.255", true},
-		{"out of range", "192.168.2.1", false},
-		{"invalid IP", "not-an-ip", false},
-		{"empty string", "", false},
+		{"in range", netip.MustParseAddr("192.168.1.100"), true},
+		{"network address", netip.MustParseAddr("192.168.1.0"), true},
+		{"broadcast", netip.MustParseAddr("192.168.1.255"), true},
+		{"out of range", netip.MustParseAddr("192.168.2.1"), false},
+		{"zero addr", netip.Addr{}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := OnNetworkPrefix(tt.ip, prefix); got != tt.expected {
-				t.Errorf("OnNetworkPrefix(%q, %s) = %v, want %v", tt.ip, prefix, got, tt.expected)
+				t.Errorf("OnNetworkPrefix(%s, %s) = %v, want %v", tt.ip, prefix, got, tt.expected)
 			}
 		})
 	}

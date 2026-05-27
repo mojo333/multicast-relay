@@ -134,10 +134,10 @@ func TestDuplicateDetectionSequentialStress(t *testing.T) {
 func TestIsAllowedByFilterNoFilters(t *testing.T) {
 	pr := &PacketRelay{}
 	// With no filters, everything should be allowed
-	if !pr.isAllowedByFilter("192.168.1.100", "eth0") {
+	if !pr.isAllowedByFilter(netip.MustParseAddr("192.168.1.100"), "eth0") {
 		t.Error("expected allowed with no filters")
 	}
-	if !pr.isAllowedByFilter("10.0.0.1", "wlan0") {
+	if !pr.isAllowedByFilter(netip.MustParseAddr("10.0.0.1"), "wlan0") {
 		t.Error("expected allowed with no filters")
 	}
 }
@@ -158,18 +158,18 @@ func TestIsAllowedByFilter(t *testing.T) {
 
 	tests := []struct {
 		name    string
-		srcAddr string
+		srcAddr netip.Addr
 		txIface string
 		allowed bool
 	}{
-		{"192.168.1.x to eth0 allowed", "192.168.1.100", "eth0", true},
-		{"192.168.1.x to eth1 allowed", "192.168.1.50", "eth1", true},
-		{"192.168.1.x to wlan0 blocked", "192.168.1.100", "wlan0", false},
-		{"192.168.1.x to eth2 blocked", "192.168.1.1", "eth2", false},
-		{"10.x to wlan0 allowed", "10.5.3.1", "wlan0", true},
-		{"10.x to eth0 blocked", "10.5.3.1", "eth0", false},
-		{"unmatched network defaults to allowed", "172.16.0.1", "eth0", true},
-		{"unmatched network defaults to allowed any iface", "172.16.0.1", "wlan0", true},
+		{"192.168.1.x to eth0 allowed", netip.MustParseAddr("192.168.1.100"), "eth0", true},
+		{"192.168.1.x to eth1 allowed", netip.MustParseAddr("192.168.1.50"), "eth1", true},
+		{"192.168.1.x to wlan0 blocked", netip.MustParseAddr("192.168.1.100"), "wlan0", false},
+		{"192.168.1.x to eth2 blocked", netip.MustParseAddr("192.168.1.1"), "eth2", false},
+		{"10.x to wlan0 allowed", netip.MustParseAddr("10.5.3.1"), "wlan0", true},
+		{"10.x to eth0 blocked", netip.MustParseAddr("10.5.3.1"), "eth0", false},
+		{"unmatched network defaults to allowed", netip.MustParseAddr("172.16.0.1"), "eth0", true},
+		{"unmatched network defaults to allowed any iface", netip.MustParseAddr("172.16.0.1"), "wlan0", true},
 	}
 
 	for _, tt := range tests {
@@ -309,13 +309,13 @@ func TestParseIfFilterFileIntegration(t *testing.T) {
 
 	pr := &PacketRelay{parsedFilters: filters}
 
-	if !pr.isAllowedByFilter("192.168.1.50", "eth0") {
+	if !pr.isAllowedByFilter(netip.MustParseAddr("192.168.1.50"), "eth0") {
 		t.Error("expected 192.168.1.50 allowed to eth0")
 	}
-	if pr.isAllowedByFilter("192.168.1.50", "wlan0") {
+	if pr.isAllowedByFilter(netip.MustParseAddr("192.168.1.50"), "wlan0") {
 		t.Error("expected 192.168.1.50 blocked to wlan0")
 	}
-	if !pr.isAllowedByFilter("10.0.0.1", "wlan0") {
+	if !pr.isAllowedByFilter(netip.MustParseAddr("10.0.0.1"), "wlan0") {
 		t.Error("expected 10.0.0.1 allowed to any interface (no matching filter)")
 	}
 }
@@ -463,6 +463,7 @@ func TestReadRemoteConnections(t *testing.T) {
 		noRemoteRelay:  true, // prevent processPacket from writing back to remotes
 		connsDirty:     true,
 		remoteReadBufs: make(map[net.Conn]*remoteReadBuf),
+		remoteTmpBuf:   make([]byte, 4096),
 	}
 
 	// Create a pipe to simulate a remote connection
@@ -529,6 +530,7 @@ func TestReadRemoteConnectionsInvalidMagic(t *testing.T) {
 		aes:            aes,
 		noRemoteRelay:  true,
 		remoteReadBufs: make(map[net.Conn]*remoteReadBuf),
+		remoteTmpBuf:   make([]byte, 4096),
 	}
 
 	server, client := net.Pipe()
@@ -569,6 +571,7 @@ func TestReadRemoteConnectionsDeadConnection(t *testing.T) {
 		noRemoteRelay:  true,
 		connsDirty:     true,
 		remoteReadBufs: make(map[net.Conn]*remoteReadBuf),
+		remoteTmpBuf:   make([]byte, 4096),
 	}
 
 	server, client := net.Pipe()
