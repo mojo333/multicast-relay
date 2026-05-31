@@ -17,6 +17,8 @@ import (
 	"github.com/mojo333/multicast-relay/internal/relay"
 )
 
+var version = "dev"
+
 // stringSlice implements flag.Value for repeatable string flags.
 type stringSlice []string
 
@@ -148,7 +150,8 @@ func run() int {
 	}
 
 	// Log startup to monitor
-	log.Monitor("Process started (pid %d)", os.Getpid())
+	log.Info("multicast-relay %s starting", version)
+	log.Monitor("Process started (pid %d, version %s)", os.Getpid(), version)
 	log.Monitor("Parameters: %s", formatArgs())
 
 	// Build relay set
