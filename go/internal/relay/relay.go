@@ -40,8 +40,12 @@ const (
 	// maxPacketSize is the maximum expected packet size for pooled buffers.
 	maxPacketSize = 10240
 
-	minUDPPacketLen     = 28                // min IP(20)+UDP(8) header
-	maxRemoteMessageLen = maxPacketSize + 32 // cap on remote framing
+	minUDPPacketLen = 28 // min IP(20)+UDP(8) header
+
+	// maxRemoteMessageLen caps the remote TCP framing length prefix. The frame
+	// body is magic(4) + senderIP(4) + packet(<=maxPacketSize), plus GCM
+	// nonce(12) + tag(16) when AES is enabled.
+	maxRemoteMessageLen = maxPacketSize + 4 + 4 + 12 + 16
 )
 
 var (

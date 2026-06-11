@@ -189,7 +189,7 @@ func TestParseIfFilterFile(t *testing.T) {
 		path := filepath.Join(dir, "filter.json")
 		data := map[string][]string{
 			"192.168.1.0/24": {"eth0", "eth1"},
-			"10.0.0.0/8":    {"wlan0"},
+			"10.0.0.0/8":     {"wlan0"},
 		}
 		raw, _ := json.Marshal(data)
 		os.WriteFile(path, raw, 0644)
@@ -632,5 +632,71 @@ func TestRemoteSocketsCollectsAll(t *testing.T) {
 	conns := pr.remoteSockets()
 	if len(conns) != 2 {
 		t.Errorf("expected 2 connections, got %d", len(conns))
+	}
+}
+
+func TestMaxRemoteMessageLenFitsMaxPacket(t *testing.T) {
+	aes, err := cipher.New("test-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Worst-case remote relay payload: magic + senderIP + max-size packet.
+	payload := make([]byte, 0, len(magicBytes)+4+maxPacketSize)
+	payload = append(payload, magicBytes[:]...)
+	payload = append(payload, make([]byte, 4)...)
+	payload = append(payload, make([]byte, maxPacketSize)...)
+
+	frame, err := aes.EncryptFrame(payload)
+	if err != nil {
+		t.Fatalf("EncryptFrame() error = %v", err)
+	}
+
+	bodyLen := int(binary.BigEndian.Uint16(frame[:2]))
+	if bodyLen > maxRemoteMessageLen {
+		t.Errorf("max-size frame body = %d exceeds maxRemoteMessageLen = %d; the receiving peer would reject it and drop the connection", bodyLen, maxRemoteMessageLen)
+	}
+}
+
+func TestDialRemoteReturnsAfterClose(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+
+	aes, err := cipher.New("")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pr := &PacketRelay{
+		logger:          newTestLogger(t),
+		aes:             aes,
+		connectResultCh: make(chan connectResult), // unbuffered: nothing drains it after Loop() exits
+		done:            make(chan struct{}),
+		remotePort:      ln.Addr().(*net.TCPAddr).Port,
+	}
+	close(pr.done) // simulate relay shut down while the dial is in flight
+
+	returned := make(chan struct{})
+	go func() {
+		pr.dialRemote(&RemoteAddr{Addr: "127.0.0.1"})
+		close(returned)
+	}()
+
+	select {
+	case <-returned:
+	case <-time.After(3 * time.Second):
+		t.Fatal("dialRemote blocked forever after relay close (goroutine leak)")
 	}
 }

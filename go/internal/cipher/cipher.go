@@ -110,17 +110,28 @@ func (c *Cipher) Encrypt(plaintext []byte) ([]byte, error) {
 	return c.gcm.Seal(nonce, nonce, plaintext, nil), nil
 }
 
+// maxFrameBody is the largest frame body the 2-byte length prefix can describe.
+const maxFrameBody = 0xffff
+
 // EncryptFrame encrypts plaintext and returns a single wire frame in one allocation:
 // [2-byte big-endian length][nonce(12)][ciphertext+tag] when AES is enabled,
 // or [2-byte length][plaintext] when AES is disabled.
+// Returns an error if the frame body would exceed what the length prefix can
+// represent — without this, the uint16 cast would silently corrupt the framing.
 func (c *Cipher) EncryptFrame(plaintext []byte) ([]byte, error) {
 	if !c.enabled {
+		if len(plaintext) > maxFrameBody {
+			return nil, fmt.Errorf("cipher: plaintext too large for frame: %d bytes (max %d)", len(plaintext), maxFrameBody)
+		}
 		frame := make([]byte, 2+len(plaintext))
 		binary.BigEndian.PutUint16(frame[0:2], uint16(len(plaintext)))
 		copy(frame[2:], plaintext)
 		return frame, nil
 	}
 	ns := c.gcm.NonceSize()
+	if ns+len(plaintext)+c.gcm.Overhead() > maxFrameBody {
+		return nil, fmt.Errorf("cipher: plaintext too large for frame: %d bytes (max %d)", len(plaintext), maxFrameBody-ns-c.gcm.Overhead())
+	}
 	// Pre-allocate: 2-byte length prefix + nonce + plaintext + GCM tag.
 	frame := make([]byte, 2+ns, 2+ns+len(plaintext)+c.gcm.Overhead())
 	if _, err := io.ReadFull(rand.Reader, frame[2:2+ns]); err != nil {

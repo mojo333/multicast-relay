@@ -7,7 +7,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-
 // Loop runs the main packet relay event loop.
 func (pr *PacketRelay) Loop() error {
 	buf := make([]byte, maxPacketSize)

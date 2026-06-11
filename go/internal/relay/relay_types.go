@@ -42,11 +42,11 @@ type RelayAddr struct {
 type Transmitter struct {
 	Relay     RelayAddr
 	Interface string
-	Addr      netip.Addr       // interface IP address
+	Addr      netip.Addr // interface IP address
 	MAC       net.HardwareAddr
-	Network   netip.Prefix     // interface network prefix, replaces Netmask string
-	Broadcast netip.Addr       // interface broadcast address
-	Socket    int              // raw AF_PACKET socket fd
+	Network   netip.Prefix // interface network prefix, replaces Netmask string
+	Broadcast netip.Addr   // interface broadcast address
+	Socket    int          // raw AF_PACKET socket fd
 	Service   string
 }
 
@@ -120,11 +120,11 @@ type PacketRelay struct {
 	checksumIdx     int
 	checksumCount   int
 
-	listenAddr      []string
-	listener        *net.TCPListener
-	acceptCh        chan net.Conn
-	connectResultCh chan connectResult // receives async dial outcomes
-	remoteAddrs     []*RemoteAddr
+	listenAddr        []string
+	listener          *net.TCPListener
+	acceptCh          chan net.Conn
+	connectResultCh   chan connectResult // receives async dial outcomes
+	remoteAddrs       []*RemoteAddr
 	remotePort        int
 	remoteRetry       int
 	noRemoteRelay     bool

@@ -142,7 +142,7 @@ func (pr *PacketRelay) connectRemotes() {
 func (pr *PacketRelay) dialRemote(ra *RemoteAddr) {
 	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ra.Addr, pr.remotePort), 5*time.Second)
 	if err != nil {
-		pr.connectResultCh <- connectResult{ra: ra, err: err}
+		pr.sendConnectResult(connectResult{ra: ra, err: err})
 		return
 	}
 
@@ -151,19 +151,32 @@ func (pr *PacketRelay) dialRemote(ra *RemoteAddr) {
 		challenge := make([]byte, 16)
 		if _, err := io.ReadFull(conn, challenge); err != nil {
 			conn.Close()
-			pr.connectResultCh <- connectResult{ra: ra, err: fmt.Errorf("auth challenge: %w", err)}
+			pr.sendConnectResult(connectResult{ra: ra, err: fmt.Errorf("auth challenge: %w", err)})
 			return
 		}
 		response := pr.aes.Respond(challenge)
 		if _, err := conn.Write(response); err != nil {
 			conn.Close()
-			pr.connectResultCh <- connectResult{ra: ra, err: fmt.Errorf("auth response: %w", err)}
+			pr.sendConnectResult(connectResult{ra: ra, err: fmt.Errorf("auth response: %w", err)})
 			return
 		}
 		conn.SetDeadline(time.Time{})
 	}
 
-	pr.connectResultCh <- connectResult{ra: ra, conn: conn}
+	pr.sendConnectResult(connectResult{ra: ra, conn: conn})
+}
+
+// sendConnectResult delivers a dial outcome to the main loop. If the relay has
+// been closed, nothing drains connectResultCh anymore, so it discards the
+// result instead — otherwise the dial goroutine would block forever.
+func (pr *PacketRelay) sendConnectResult(res connectResult) {
+	select {
+	case pr.connectResultCh <- res:
+	case <-pr.done:
+		if res.conn != nil {
+			res.conn.Close()
+		}
+	}
 }
 
 // removeConnection removes a remote connection from the active set and cleans up its read buffer.

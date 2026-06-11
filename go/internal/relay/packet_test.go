@@ -297,19 +297,19 @@ func TestModifyUDPPacketWithIPOptions(t *testing.T) {
 	// Build a packet with IP options (IHL=6, 24-byte IP header)
 	// Bytes 0-19: standard IP header, bytes 20-23: IP options
 	ipHeader := []byte{
-		0x46, 0x00,                         // version=4, IHL=6 (24 bytes)
-		0x00, 0x24,                         // total length = 36 (24 IP + 8 UDP + 4 data)
-		0x12, 0x34, 0x40, 0x00,             // ID, flags, fragment offset
-		0x40, 0x11,                         // TTL=64, protocol=UDP
-		0x00, 0x00,                         // checksum (will be recomputed)
-		0xc0, 0xa8, 0x01, 0x64,             // src: 192.168.1.100
-		0xc0, 0xa8, 0x01, 0x01,             // dst: 192.168.1.1
-		0x01, 0x02, 0x03, 0x04,             // IP options (4 bytes)
+		0x46, 0x00, // version=4, IHL=6 (24 bytes)
+		0x00, 0x24, // total length = 36 (24 IP + 8 UDP + 4 data)
+		0x12, 0x34, 0x40, 0x00, // ID, flags, fragment offset
+		0x40, 0x11, // TTL=64, protocol=UDP
+		0x00, 0x00, // checksum (will be recomputed)
+		0xc0, 0xa8, 0x01, 0x64, // src: 192.168.1.100
+		0xc0, 0xa8, 0x01, 0x01, // dst: 192.168.1.1
+		0x01, 0x02, 0x03, 0x04, // IP options (4 bytes)
 	}
 	udpHeader := []byte{
-		0x04, 0xd2, 0x00, 0x35,             // src port 1234, dst port 53
-		0x00, 0x0c,                         // UDP length = 12
-		0x00, 0x00,                         // checksum
+		0x04, 0xd2, 0x00, 0x35, // src port 1234, dst port 53
+		0x00, 0x0c, // UDP length = 12
+		0x00, 0x00, // checksum
 	}
 	udpData := []byte{0xAA, 0xBB, 0xCC, 0xDD}
 
