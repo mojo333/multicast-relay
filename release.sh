@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO="mojo333/multicast-relay"
-TAG="v2.6"
+TAG="v2.7"
 TARGET="master"
 BINDIR="$(mktemp -d)"
 
@@ -25,12 +25,23 @@ gh release create "${TAG}" \
   --target "${TARGET}" \
   --title "${TAG}" \
   --notes "$(cat <<'EOF'
-## What's Changed since v2.5
+## What's Changed since v2.6
 
-### Features
-- Version number embedded in binary at build time via `-X main.version`
-- Version logged on startup (regular log and monitor log)
-- Unversioned local builds report `dev`
+### Fixes
+- Corrected `maxRemoteMessageLen` to match the worst-case AES-encrypted
+  remote frame size (10276 bytes), preventing max-size packets from
+  being rejected and dropping the remote connection.
+- `EncryptFrame` now returns an error instead of silently truncating
+  the wire-protocol length prefix if a frame body exceeds 65535 bytes.
+- Fixed a goroutine leak in `dialRemote`: in-flight dial results are
+  now discarded via a select against the relay's shutdown signal
+  instead of blocking forever after `Close()`.
+
+### Tests
+- Added cipher tests for `EncryptFrame` round-trip/size limits and the
+  Challenge/Respond/Verify handshake (coverage 59% -> 92.7%).
+- Added relay regression tests for the frame size limit and dial
+  shutdown path.
 
 ## Binaries
 
