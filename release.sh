@@ -20,26 +20,24 @@ ls -lh "${BINDIR}"/multicast-relay-*
 file "${BINDIR}"/multicast-relay-*
 
 echo "==> Creating ${TAG} release on ${TARGET}..."
-gh release create "${TAG}" \
-  --repo "${REPO}" \
-  --target "${TARGET}" \
-  --title "${TAG}" \
-  --notes "$(cat <<'EOF'
+NOTES_FILE="${BINDIR}/notes.md"
+cat > "${NOTES_FILE}" <<'EOF'
 ## What's Changed since v2.6
 
 ### Fixes
 - Corrected `maxRemoteMessageLen` to match the worst-case AES-encrypted
-  remote frame size (10276 bytes), preventing max-size packets from
+  remote frame size, 10276 bytes, preventing max-size packets from
   being rejected and dropping the remote connection.
 - `EncryptFrame` now returns an error instead of silently truncating
   the wire-protocol length prefix if a frame body exceeds 65535 bytes.
 - Fixed a goroutine leak in `dialRemote`: in-flight dial results are
   now discarded via a select against the relay's shutdown signal
-  instead of blocking forever after `Close()`.
+  instead of blocking forever after the relay closes.
 
 ### Tests
-- Added cipher tests for `EncryptFrame` round-trip/size limits and the
-  Challenge/Respond/Verify handshake (coverage 59% -> 92.7%).
+- Added cipher tests for `EncryptFrame` round-trip and size limits and
+  for the Challenge, Respond, and Verify handshake, raising coverage
+  from 59% to 92.7%.
 - Added relay regression tests for the frame size limit and dial
   shutdown path.
 
@@ -51,7 +49,12 @@ Statically linked Linux binaries (no CGO, stripped):
 - `multicast-relay-arm64` — Linux aarch64
 - `multicast-relay-armv7` — Linux ARMv7 (e.g. Raspberry Pi)
 EOF
-)" \
+
+gh release create "${TAG}" \
+  --repo "${REPO}" \
+  --target "${TARGET}" \
+  --title "${TAG}" \
+  --notes-file "${NOTES_FILE}" \
   "${BINDIR}/multicast-relay-amd64" \
   "${BINDIR}/multicast-relay-arm64" \
   "${BINDIR}/multicast-relay-armv7"
