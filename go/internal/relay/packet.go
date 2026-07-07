@@ -62,12 +62,11 @@ func ComputeIPChecksum(data []byte, ipHeaderLength int) []byte {
 	return data
 }
 
-// ComputeUDPChecksum computes the UDP checksum using the pseudo-header.
-// Computes incrementally across pseudo-header, UDP header, and data without concatenation.
-func ComputeUDPChecksum(ipHeader, udpHeader, data []byte) []byte {
-	if len(ipHeader) < 20 || len(udpHeader) < 8 {
-		return udpHeader
-	}
+// udpChecksumValue computes the UDP checksum value over the pseudo-header, UDP
+// header, and data without concatenation. Per RFC 768, a computed checksum of
+// zero is transmitted as all-ones (0xFFFF), since an on-wire 0x0000 signals
+// "checksum not computed."
+func udpChecksumValue(ipHeader, udpHeader, data []byte) uint16 {
 	var sum uint32
 	sum = checksumAdd(sum, ipHeader[12:20])                // src + dst IP
 	sum += uint32(ipHeader[9])                             // protocol
@@ -77,11 +76,47 @@ func ComputeUDPChecksum(ipHeader, udpHeader, data []byte) []byte {
 	sum = checksumAdd(sum, data)
 
 	checksum := checksumFinalize(sum)
+	if checksum == 0 {
+		checksum = 0xffff
+	}
+	return checksum
+}
+
+// ComputeUDPChecksum computes the UDP checksum using the pseudo-header and
+// returns a fresh 8-byte UDP header with the checksum field set.
+func ComputeUDPChecksum(ipHeader, udpHeader, data []byte) []byte {
+	if len(ipHeader) < 20 || len(udpHeader) < 8 {
+		return udpHeader
+	}
+	checksum := udpChecksumValue(ipHeader, udpHeader, data)
 
 	result := make([]byte, 8)
 	copy(result, udpHeader[:6])
 	binary.BigEndian.PutUint16(result[6:8], checksum)
 	return result
+}
+
+// copyIPPayloadRange copies the [start:end) byte range of the virtual
+// concatenation (udpHeader ++ payload) into dst. udpHeader is 8 bytes; bytes at
+// virtual offset < 8 come from udpHeader, the rest from payload. Used to build
+// IP fragments without materializing the full IP payload in a heap buffer.
+func copyIPPayloadRange(dst, udpHeader, payload []byte, start, end int) {
+	n := 0
+	if start < len(udpHeader) {
+		hEnd := end
+		if hEnd > len(udpHeader) {
+			hEnd = len(udpHeader)
+		}
+		n += copy(dst[n:], udpHeader[start:hEnd])
+	}
+	pStart := start - len(udpHeader)
+	if pStart < 0 {
+		pStart = 0
+	}
+	pEnd := end - len(udpHeader)
+	if pEnd > pStart {
+		copy(dst[n:], payload[pStart:pEnd])
+	}
 }
 
 // ModifyUDPPacket modifies the source/destination address and port of a UDP packet.
@@ -142,7 +177,11 @@ func ModifyUDPPacket(data []byte, ipHeaderLength int, newSrc netip.Addr, newSrcP
 // MdnsSetUnicastBit sets the UNICAST-RESPONSE bit in mDNS query packets.
 func MdnsSetUnicastBit(data []byte, ipHeaderLength int) []byte {
 	udpDataStart := ipHeaderLength + 8
-	if len(data) < udpDataStart+4 {
+	// Require the full 12-byte DNS header: flags at [2:4], question count at
+	// [4:6], and the label loop below begins at offset 12. A shorter guard
+	// (e.g. +4) lets a 4- or 5-byte payload reach the udpData[4:6] read and
+	// panic, which would crash the relay on a crafted mDNS packet.
+	if len(data) < udpDataStart+12 {
 		return data
 	}
 	flags := binary.BigEndian.Uint16(data[udpDataStart+2 : udpDataStart+4])

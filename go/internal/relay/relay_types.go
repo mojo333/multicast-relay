@@ -1,7 +1,6 @@
 package relay
 
 import (
-	"bytes"
 	"net"
 	"net/netip"
 	"time"
@@ -12,11 +11,20 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// remoteReadBuf holds per-connection read state for remote TCP relay connections.
-type remoteReadBuf struct {
-	buf        bytes.Buffer
-	msgLen     int
-	lastActive time.Time
+// remotePacket is a decoded packet delivered from a connection's reader
+// goroutine to the main loop for relaying.
+type remotePacket struct {
+	senderAddr netip.Addr
+	data       []byte
+}
+
+// remoteWriter owns the writer goroutine for a single remote connection.
+// The event loop enqueues frames on ch; the goroutine writes them so a slow
+// peer cannot block the loop. done is closed to stop the goroutine.
+type remoteWriter struct {
+	conn net.Conn
+	ch   chan []byte
+	done chan struct{}
 }
 
 // ssdpSearchSource tracks the most recent SSDP search source for unicast reply routing.
@@ -130,12 +138,20 @@ type PacketRelay struct {
 	noRemoteRelay     bool
 	aes               *cipher.Cipher
 	remoteConnections []net.Conn
-	connectedRemotes  []net.Conn // cached union of all active remote connections
-	connsDirty        bool       // true when connectedRemotes needs rebuilding
-	remoteReadBufs    map[net.Conn]*remoteReadBuf
+	connectedRemotes  []net.Conn                 // cached union of all active remote connections
+	connsDirty        bool                       // true when connectedRemotes needs rebuilding
+	remoteWriters     map[net.Conn]*remoteWriter // per-connection writer goroutines
+	remoteSeq         uint64                     // monotonic sequence for outbound frames
 
-	// remoteTmpBuf is a pre-allocated read buffer for remote TCP connection reads.
-	remoteTmpBuf []byte
+	// remotePacketCh receives decoded packets from per-connection reader
+	// goroutines; remoteFailedCh receives connections whose reader hit an error.
+	remotePacketCh chan remotePacket
+	remoteFailedCh chan net.Conn
+
+	// ARP resolution cache for SSDP unicast reply routing (main-loop only).
+	arpCacheIP   string
+	arpCacheMAC  net.HardwareAddr
+	arpCacheTime time.Time
 
 	// Pre-allocated poll structures rebuilt when receivers change.
 	pollFds   []unix.PollFd

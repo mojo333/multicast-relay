@@ -11,6 +11,14 @@ import (
 func (pr *PacketRelay) Loop() error {
 	buf := make([]byte, maxPacketSize)
 
+	// When remote relay is active, remote TCP connections are serviced once per
+	// loop iteration, so a shorter poll timeout bounds remote packet latency when
+	// the box is otherwise idle. Poll still wakes immediately on local traffic.
+	pollTimeoutMs := 1000
+	if len(pr.remoteAddrs) > 0 || len(pr.listenAddr) > 0 {
+		pollTimeoutMs = 100
+	}
+
 	for {
 		select {
 		case <-pr.done:
@@ -44,6 +52,7 @@ func (pr *PacketRelay) Loop() error {
 					} else {
 						result.ra.Conn = result.conn
 						pr.connsDirty = true
+						pr.startReader(result.conn)
 						pr.logger.Info("REMOTE: Connection to %s established", result.ra.Addr)
 					}
 				default:
@@ -60,6 +69,7 @@ func (pr *PacketRelay) Loop() error {
 				case conn := <-pr.acceptCh:
 					pr.remoteConnections = append(pr.remoteConnections, conn)
 					pr.connsDirty = true
+					pr.startReader(conn)
 					pr.logger.Info("REMOTE: Accepted connection from %s", conn.RemoteAddr())
 				default:
 					break drainAccept
@@ -67,15 +77,15 @@ func (pr *PacketRelay) Loop() error {
 			}
 		}
 
-		// Read from remote TCP connections
-		pr.readRemoteConnections()
+		// Process packets decoded by remote reader goroutines.
+		pr.drainRemotePackets()
 
 		// Clear revents before polling
 		for i := range pr.pollFds {
 			pr.pollFds[i].Revents = 0
 		}
 
-		n, err := unix.Poll(pr.pollFds, 1000) // 1 second timeout
+		n, err := unix.Poll(pr.pollFds, pollTimeoutMs)
 		if err != nil {
 			if err == unix.EINTR {
 				continue
@@ -91,7 +101,9 @@ func (pr *PacketRelay) Loop() error {
 				continue
 			}
 
-			// Local receiver
+			// Local receiver. processPacket runs synchronously and copies whatever
+			// it needs to retain, so buf can be passed directly without a defensive
+			// copy into a pooled buffer.
 			nread, from, err := unix.Recvfrom(int(pfd.Fd), buf, 0)
 			if err != nil {
 				pr.logger.Warning("Error receiving packet: %s", err)
@@ -101,18 +113,12 @@ func (pr *PacketRelay) Loop() error {
 				continue
 			}
 
-			dataBp := getBuffer(nread)
-			copy(*dataBp, buf[:nread])
-
 			sa, ok := from.(*unix.SockaddrInet4)
 			if !ok {
-				putBuffer(dataBp)
 				continue
 			}
 			senderAddr := AddrFrom4Bytes(sa.Addr[:])
-
-			pr.processPacket(*dataBp, senderAddr, "local")
-			putBuffer(dataBp)
+			pr.processPacket(buf[:nread], senderAddr, "local")
 		}
 	}
 }

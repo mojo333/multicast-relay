@@ -397,7 +397,7 @@ func newTestLogger(t *testing.T) *logger.Logger {
 
 func TestRemoveConnectionFromRemoteConnections(t *testing.T) {
 	pr := &PacketRelay{
-		remoteReadBufs: make(map[net.Conn]*remoteReadBuf),
+		remoteWriters: make(map[net.Conn]*remoteWriter),
 	}
 
 	// Create a pair of connected pipes to use as mock connections
@@ -410,8 +410,6 @@ func TestRemoveConnectionFromRemoteConnections(t *testing.T) {
 	defer client2.Close()
 
 	pr.remoteConnections = []net.Conn{server, server2}
-	pr.remoteReadBufs[server] = &remoteReadBuf{msgLen: -1}
-	pr.remoteReadBufs[server2] = &remoteReadBuf{msgLen: -1}
 
 	pr.removeConnection(server)
 
@@ -421,14 +419,11 @@ func TestRemoveConnectionFromRemoteConnections(t *testing.T) {
 	if pr.remoteConnections[0] != server2 {
 		t.Error("wrong connection removed")
 	}
-	if _, ok := pr.remoteReadBufs[server]; ok {
-		t.Error("read buffer for removed connection should be deleted")
-	}
 }
 
 func TestRemoveConnectionFromRemoteAddrs(t *testing.T) {
 	pr := &PacketRelay{
-		remoteReadBufs: make(map[net.Conn]*remoteReadBuf),
+		remoteWriters: make(map[net.Conn]*remoteWriter),
 	}
 
 	server, client := net.Pipe()
@@ -448,154 +443,207 @@ func TestRemoveConnectionFromRemoteAddrs(t *testing.T) {
 	}
 }
 
+func TestIsRemoteBroadcast(t *testing.T) {
+	pr := &PacketRelay{
+		transmitters: []Transmitter{
+			{ // broadcast transmitter: Relay.Addr == Broadcast
+				Relay:     RelayAddr{Addr: netip.MustParseAddr("192.168.2.255"), Port: 6969},
+				Broadcast: netip.MustParseAddr("192.168.2.255"),
+			},
+			{ // multicast transmitter: Relay.Addr != Broadcast
+				Relay:     RelayAddr{Addr: netip.MustParseAddr("239.255.255.250"), Port: 1900},
+				Broadcast: netip.MustParseAddr("192.168.2.255"),
+			},
+		},
+	}
+
+	// A broadcast from another site on the broadcast relay port is recognized.
+	if !pr.isRemoteBroadcast(netip.MustParseAddr("192.168.1.255"), 6969) {
+		t.Error("expected remote broadcast on port 6969 to be recognized")
+	}
+	// A multicast destination is never a broadcast.
+	if pr.isRemoteBroadcast(netip.MustParseAddr("239.255.255.250"), 1900) {
+		t.Error("multicast destination must not be treated as broadcast")
+	}
+	// A port with no broadcast transmitter is not a broadcast.
+	if pr.isRemoteBroadcast(netip.MustParseAddr("192.168.1.255"), 1234) {
+		t.Error("unmatched port must not be treated as broadcast")
+	}
+}
+
 // --- Remote relay protocol tests ---
 
-func TestReadRemoteConnections(t *testing.T) {
-	log := newTestLogger(t)
-	aes, err := cipher.New("")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	pr := &PacketRelay{
-		logger:         log,
-		aes:            aes,
-		noRemoteRelay:  true, // prevent processPacket from writing back to remotes
-		connsDirty:     true,
-		remoteReadBufs: make(map[net.Conn]*remoteReadBuf),
-		remoteTmpBuf:   make([]byte, 4096),
-	}
-
-	// Create a pipe to simulate a remote connection
-	server, client := net.Pipe()
-	defer server.Close()
-	defer client.Close()
-
-	pr.remoteConnections = []net.Conn{server}
-
-	// Build a valid remote relay message: 2-byte length + magic + senderIP + packet
-	// Minimum packet is 28 bytes (20 IP header + 8 UDP header)
+// minUDPTestPacket builds a minimal 28-byte IPv4/UDP packet for remote-frame tests.
+func minUDPTestPacket(src, dst string, sport, dport uint16) []byte {
 	ipHeader := make([]byte, 20)
 	ipHeader[0] = 0x45 // version 4, IHL 5
 	ipHeader[8] = 64   // TTL
 	ipHeader[9] = 17   // UDP protocol
-	copy(ipHeader[12:16], net.ParseIP("192.168.1.100").To4())
-	copy(ipHeader[16:20], net.ParseIP("239.255.255.250").To4())
+	copy(ipHeader[12:16], net.ParseIP(src).To4())
+	copy(ipHeader[16:20], net.ParseIP(dst).To4())
 	binary.BigEndian.PutUint16(ipHeader[2:4], 28) // total length
 
 	udpHeader := make([]byte, 8)
-	binary.BigEndian.PutUint16(udpHeader[0:2], 1234) // src port
-	binary.BigEndian.PutUint16(udpHeader[2:4], 1900) // dst port
-	binary.BigEndian.PutUint16(udpHeader[4:6], 8)    // udp length
-
-	packetData := append(ipHeader, udpHeader...)
-
-	senderIP := net.ParseIP("192.168.1.100").To4()
-	payload := make([]byte, 0, 4+4+len(packetData))
-	payload = append(payload, magicBytes[:]...)
-	payload = append(payload, senderIP...)
-	payload = append(payload, packetData...)
-
-	encrypted, _ := aes.Encrypt(payload)
-	msg := make([]byte, 2+len(encrypted))
-	binary.BigEndian.PutUint16(msg[0:2], uint16(len(encrypted)))
-	copy(msg[2:], encrypted)
-
-	// Write the message from the client side (simulating remote sender)
-	go func() {
-		client.Write(msg)
-	}()
-
-	// Give the write a moment to complete
-	time.Sleep(50 * time.Millisecond)
-
-	// This should read the message without panicking or erroring
-	pr.readRemoteConnections()
-
-	// Verify the read buffer was initialized
-	if _, ok := pr.remoteReadBufs[server]; !ok {
-		t.Error("expected read buffer to be created for connection")
-	}
+	binary.BigEndian.PutUint16(udpHeader[0:2], sport)
+	binary.BigEndian.PutUint16(udpHeader[2:4], dport)
+	binary.BigEndian.PutUint16(udpHeader[4:6], 8) // udp length
+	return append(ipHeader, udpHeader...)
 }
 
-func TestReadRemoteConnectionsInvalidMagic(t *testing.T) {
-	log := newTestLogger(t)
+// buildRemoteFrame builds a wire frame (length prefix + body) in the current
+// format: seq(8) || magic(4) || senderIP(4) || packet.
+func buildRemoteFrame(t *testing.T, aes *cipher.Cipher, seq uint64, sender string, packet []byte) []byte {
+	t.Helper()
+	senderIP := net.ParseIP(sender).To4()
+	plain := make([]byte, 0, 8+len(magicBytes)+4+len(packet))
+	var seqB [8]byte
+	binary.BigEndian.PutUint64(seqB[:], seq)
+	plain = append(plain, seqB[:]...)
+	plain = append(plain, magicBytes[:]...)
+	plain = append(plain, senderIP...)
+	plain = append(plain, packet...)
+	frame, err := aes.EncryptFrame(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return frame
+}
+
+func newReaderTestRelay(t *testing.T) *PacketRelay {
+	t.Helper()
 	aes, err := cipher.New("")
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	pr := &PacketRelay{
-		logger:         log,
+	return &PacketRelay{
+		logger:         newTestLogger(t),
 		aes:            aes,
-		noRemoteRelay:  true,
-		remoteReadBufs: make(map[net.Conn]*remoteReadBuf),
-		remoteTmpBuf:   make([]byte, 4096),
+		done:           make(chan struct{}),
+		remotePacketCh: make(chan remotePacket, 8),
+		remoteFailedCh: make(chan net.Conn, 8),
+		remoteWriters:  make(map[net.Conn]*remoteWriter),
 	}
+}
+
+func TestRunReaderValidFrame(t *testing.T) {
+	pr := newReaderTestRelay(t)
+	defer close(pr.done)
 
 	server, client := net.Pipe()
 	defer server.Close()
 	defer client.Close()
 
-	pr.remoteConnections = []net.Conn{server}
+	packet := minUDPTestPacket("192.168.1.100", "239.255.255.250", 1234, 1900)
+	frame := buildRemoteFrame(t, pr.aes, 1, "192.168.1.100", packet)
 
-	// Build a message with invalid magic bytes
-	payload := make([]byte, 4+4+28) // magic + senderIP + min packet
-	payload[0] = 'X'                // wrong magic
+	pr.startReader(server)
+	go func() { client.Write(frame) }()
 
-	encrypted, _ := aes.Encrypt(payload)
-	msg := make([]byte, 2+len(encrypted))
-	binary.BigEndian.PutUint16(msg[0:2], uint16(len(encrypted)))
-	copy(msg[2:], encrypted)
-
-	go func() {
-		client.Write(msg)
-	}()
-
-	time.Sleep(50 * time.Millisecond)
-
-	// Should not panic — just log and skip the invalid message
-	pr.readRemoteConnections()
+	select {
+	case rp := <-pr.remotePacketCh:
+		if rp.senderAddr.String() != "192.168.1.100" {
+			t.Errorf("expected sender 192.168.1.100, got %s", rp.senderAddr)
+		}
+		if len(rp.data) != len(packet) {
+			t.Errorf("expected %d-byte packet, got %d", len(packet), len(rp.data))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for decoded packet")
+	}
 }
 
-func TestReadRemoteConnectionsDeadConnection(t *testing.T) {
-	log := newTestLogger(t)
-	aes, err := cipher.New("")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	pr := &PacketRelay{
-		logger:         log,
-		aes:            aes,
-		noRemoteRelay:  true,
-		connsDirty:     true,
-		remoteReadBufs: make(map[net.Conn]*remoteReadBuf),
-		remoteTmpBuf:   make([]byte, 4096),
-	}
+func TestRunReaderInvalidMagicSkipped(t *testing.T) {
+	pr := newReaderTestRelay(t)
+	defer close(pr.done)
 
 	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
 
-	pr.remoteConnections = []net.Conn{server}
+	// Valid length/seq framing but wrong magic bytes: must be skipped, not fatal.
+	packet := minUDPTestPacket("192.168.1.100", "239.255.255.250", 1234, 1900)
+	frame := buildRemoteFrame(t, pr.aes, 1, "192.168.1.100", packet)
+	// Corrupt the first magic byte (offset: 2 length + 8 seq = 10).
+	frame[10] ^= 0xff
 
-	// Close the client side to simulate a dead connection
+	pr.startReader(server)
+	go func() { client.Write(frame) }()
+
+	select {
+	case <-pr.remotePacketCh:
+		t.Error("invalid-magic frame should not be delivered")
+	case conn := <-pr.remoteFailedCh:
+		t.Errorf("invalid-magic frame should not fail the connection, got %v", conn)
+	case <-time.After(300 * time.Millisecond):
+		// Expected: nothing delivered, connection stays alive.
+	}
+}
+
+func TestRunReaderReplayRejected(t *testing.T) {
+	pr := newReaderTestRelay(t)
+	defer close(pr.done)
+
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	packet := minUDPTestPacket("192.168.1.100", "239.255.255.250", 1234, 1900)
+	pr.startReader(server)
+
+	// seq=5 accepted, replayed seq=5 rejected, seq=6 accepted, older seq=4 rejected.
+	go func() {
+		client.Write(buildRemoteFrame(t, pr.aes, 5, "192.168.1.100", packet))
+		client.Write(buildRemoteFrame(t, pr.aes, 5, "192.168.1.100", packet))
+		client.Write(buildRemoteFrame(t, pr.aes, 6, "192.168.1.100", packet))
+		client.Write(buildRemoteFrame(t, pr.aes, 4, "192.168.1.100", packet))
+	}()
+
+	// Exactly two frames (seq 5 and seq 6) should be delivered.
+	deadline := time.After(2 * time.Second)
+	got := 0
+	for got < 2 {
+		select {
+		case <-pr.remotePacketCh:
+			got++
+		case <-deadline:
+			t.Fatalf("expected 2 accepted frames, got %d", got)
+		}
+	}
+	// No third frame should arrive.
+	select {
+	case <-pr.remotePacketCh:
+		t.Error("replayed/old frame should not have been delivered")
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+func TestRunReaderDeadConnection(t *testing.T) {
+	pr := newReaderTestRelay(t)
+	defer close(pr.done)
+
+	server, client := net.Pipe()
+	defer server.Close()
+
+	pr.startReader(server)
+	// Close the client side to simulate a dead connection.
 	client.Close()
 
-	pr.readRemoteConnections()
-
-	// The dead connection should have been removed
-	if len(pr.remoteConnections) != 0 {
-		t.Errorf("expected 0 connections after dead conn cleanup, got %d", len(pr.remoteConnections))
+	select {
+	case conn := <-pr.remoteFailedCh:
+		if conn != server {
+			t.Error("wrong connection reported failed")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for dead connection to be reported")
 	}
-	server.Close()
 }
 
 // --- Close/shutdown tests ---
 
 func TestCloseSignalsLoop(t *testing.T) {
 	pr := &PacketRelay{
-		done:           make(chan struct{}),
-		remoteReadBufs: make(map[net.Conn]*remoteReadBuf),
+		done:          make(chan struct{}),
+		remoteWriters: make(map[net.Conn]*remoteWriter),
 	}
 
 	pr.Close()
@@ -641,10 +689,9 @@ func TestMaxRemoteMessageLenFitsMaxPacket(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Worst-case remote relay payload: magic + senderIP + max-size packet.
-	payload := make([]byte, 0, len(magicBytes)+4+maxPacketSize)
-	payload = append(payload, magicBytes[:]...)
-	payload = append(payload, make([]byte, 4)...)
+	// Worst-case remote relay payload: seq + magic + senderIP + max-size packet.
+	payload := make([]byte, 0, remoteHeaderLen+maxPacketSize)
+	payload = append(payload, make([]byte, remoteHeaderLen)...)
 	payload = append(payload, make([]byte, maxPacketSize)...)
 
 	frame, err := aes.EncryptFrame(payload)
@@ -656,6 +703,89 @@ func TestMaxRemoteMessageLenFitsMaxPacket(t *testing.T) {
 	if bodyLen > maxRemoteMessageLen {
 		t.Errorf("max-size frame body = %d exceeds maxRemoteMessageLen = %d; the receiving peer would reject it and drop the connection", bodyLen, maxRemoteMessageLen)
 	}
+}
+
+func freeTCPPort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	l.Close()
+	return port
+}
+
+func TestRemoteMutualAuthHandshake(t *testing.T) {
+	port := freeTCPPort(t)
+
+	newRelay := func(key string, listen, remote []string) *PacketRelay {
+		pr, err := New(Config{
+			Listen:      listen,
+			Remote:      remote,
+			RemotePort:  port,
+			RemoteRetry: 1,
+			AESKey:      key,
+			Logger:      newTestLogger(t),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return pr
+	}
+
+	t.Run("matching keys complete handshake", func(t *testing.T) {
+		server := newRelay("shared-secret", []string{"127.0.0.1"}, nil)
+		defer server.Close()
+		client := newRelay("shared-secret", nil, []string{"127.0.0.1"})
+		defer client.Close()
+
+		go client.dialRemote(client.remoteAddrs[0])
+
+		select {
+		case conn := <-server.acceptCh:
+			conn.Close()
+		case <-time.After(3 * time.Second):
+			t.Fatal("server did not accept an authenticated connection")
+		}
+		select {
+		case res := <-client.connectResultCh:
+			if res.err != nil {
+				t.Fatalf("client handshake failed: %v", res.err)
+			}
+			if res.conn != nil {
+				res.conn.Close()
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("client dial produced no result")
+		}
+	})
+
+	t.Run("mismatched key is rejected", func(t *testing.T) {
+		server := newRelay("right-key", []string{"127.0.0.1"}, nil)
+		defer server.Close()
+		client := newRelay("wrong-key", nil, []string{"127.0.0.1"})
+		defer client.Close()
+
+		go client.dialRemote(client.remoteAddrs[0])
+
+		// The server must not hand up an authenticated connection.
+		select {
+		case conn := <-server.acceptCh:
+			conn.Close()
+			t.Fatal("server accepted a connection with the wrong key")
+		case <-time.After(500 * time.Millisecond):
+		}
+		// The client dial must report an error rather than a usable connection.
+		select {
+		case res := <-client.connectResultCh:
+			if res.err == nil {
+				t.Fatal("client accepted a server it could not authenticate")
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("client dial produced no result")
+		}
+	})
 }
 
 func TestDialRemoteReturnsAfterClose(t *testing.T) {
