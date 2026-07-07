@@ -32,7 +32,7 @@ that IP forwarding is enabled (`echo 1 > /proc/sys/net/ipv4/ip_forward`) and
 that no firewalling is in place that would prevent connections being
 established.
 
-`usage: multicast-relay-<platform> [-h] --interfaces INTERFACE INTERFACE [INTERFACE ...] [--noTransmitInterfaces INTERFACE ...] [-ifFilter IFFILTER] [--relay BROADCAST_OR_MULTICAST:PORT [BROADCAST_OR_MULTICAST:PORT ...]] [--noMDNS] [--noSSDP] [--noSonosDiscovery] [--oneInterface] [--homebrewNetifaces] [--wait] [--listen REMOTE_ADDRESS [REMOTE_ADDRESS ...]] [--remote REMOTE_ADDRESS] [--remotePort PORT] [--remoteRetry SECS] [--foreground] [--logfile FILE] [--verbose]`
+`usage: multicast-relay-<platform> --interfaces INTERFACE [INTERFACE ...] [--noTransmitInterfaces INTERFACE ...] [--ifFilter IFFILTER] [--ssdpUnicastAddr ADDR] [--relay BROADCAST_OR_MULTICAST:PORT ...] [--noMDNS] [--mdnsForceUnicast] [--noSSDP] [--noSonosDiscovery] [--oneInterface] [--allowNonEther] [--masquerade INTERFACE ...] [--wait] [--ttl TTL] [--listen REMOTE_ADDRESS ...] [--remote REMOTE_ADDRESS ...] [--remotePort PORT] [--remoteRetry SECS] [--noRemoteRelay] [--aes KEY] [--drop-user USER] [--foreground] [--logfile FILE] [--verbose] [--monitor FILE]`
 
 `--interfaces` specifies the >= 2 interfaces that you desire to listen to and
 relay between. You can specify an interface by name, by IP address, or by
@@ -47,9 +47,13 @@ in applications such as a hotel where relaying for one guest room may only
 discover device(s) that are in the same guest room. See example file
 `ifFilter.json`.
 
+`--ssdpUnicastAddr` specifies an IP address to listen on for SSDP unicast replies.
+
 `--relay` specifies additional broadcast or multicast addresses to relay.
 
 `--noMDNS` disables mDNS relaying.
+
+`--mdnsForceUnicast` forces relayed mDNS packets to have the UNICAST-RESPONSE bit set.
 
 `--noSSDP` disables SSDP relaying.
 
@@ -59,15 +63,16 @@ discover device(s) that are in the same guest room. See example file
 caution - watch out for packet storms (although the IP checksum list ought
 to still prevent such a thing from happening).
 
-`--homebrewNetifaces` attempt to use our own netifaces implementation, probably
-doesn't work on any other system than Linux but maybe useful for OpenWRT where
-it's rather tricky to compile up netifaces.
-
 `--allowNonEther` supports non-ethernet interfaces to be relayed [experimental].
+
+`--masquerade` rewrites the source address of outbound packets on the given
+interface(s) to that interface's own address, similar to NAT masquerading.
 
 `--wait` indicates that the relay should wait for an IPv4 address to be assigned
 to each interface rather than bailing immediately if an interface is yet to be
 assigned an address.
+
+`--ttl` sets the TTL on outbound packets (1-255); default leaves the TTL unchanged.
 
 `--listen` for connections from the specified remote host(s).
 
@@ -78,7 +83,13 @@ are specified, then one can also specify just one local interface with --interfa
 
 `--remoteRetry` if the remote connection fails, wait at least this number of seconds before retrying (default: 5).
 
-`--aes` use the specified string to encrypt/decrypt data packets.
+`--noRemoteRelay` only relay on local interfaces, ignoring any --listen/--remote configuration.
+
+`--aes` use the specified string to encrypt/decrypt data packets sent to remote
+relays. Can also be set via the `MULTICAST_RELAY_AES_KEY` environment variable.
+
+`--drop-user` drop root privileges to this unprivileged user after socket setup
+(Linux only, requires starting as root).
 
 `--foreground` stops the process forking itself off into the background. This
 flag also encourages logging to stdout as well as to the syslog.
@@ -86,4 +97,6 @@ flag also encourages logging to stdout as well as to the syslog.
 `--logfile` saves log data to the specified file.
 
 `--verbose` steps up the logging.
+
+`--monitor` writes startup, error, and shutdown events to the specified log file.
 
