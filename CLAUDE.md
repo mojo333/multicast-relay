@@ -7,14 +7,18 @@ A Go reimplementation of Al Smith's Python multicast-relay. Relays broadcast and
 ```
 go/
   cmd/multicast-relay/main.go       # CLI entry point, flag parsing, signal handling
-  internal/relay/relay.go           # Core engine: PacketRelay, socket setup, Loop()
+  internal/relay/relay.go           # PacketRelay struct, constructor, top-level setup
+  internal/relay/relay_types.go     # Shared relay types (remoteReadBuf, etc.)
+  internal/relay/relay_loop.go      # Loop(): unix.Poll()-driven event loop
+  internal/relay/relay_socket.go    # AddListener: receive/transmit socket setup, multicast/broadcast join
+  internal/relay/relay_remote.go    # Remote TCP mesh: framing, read/dispatch of remote connections
   internal/relay/packet.go          # IP/UDP checksums, packet modification, multicast/broadcast helpers
   internal/relay/arp.go             # ARP table lookup via /proc/net/arp
   internal/cipher/cipher.go         # AES-256-GCM encryption for remote relay connections
   internal/logger/logger.go         # slog-based logging (syslog, stdout, file, monitor)
   go.mod / go.sum
 release.sh                          # Cross-compiles and publishes a GitHub release via gh
-.github/workflows/build.yml         # CI: test + cross-compile for amd64/arm64/armv7
+.github/workflows/build.yml         # CI: test + cross-compile for amd64/arm64/armv7, run with -race
 ```
 
 ## Build & Test
@@ -44,7 +48,7 @@ Releases are published with `./release.sh` (requires `gh` CLI).
 ## Key Architecture Notes
 
 - **Raw sockets**: uses `AF_PACKET` sockets for packet capture and transmission (Linux only).
-- **Event loop**: single-threaded, driven by `unix.Poll()` with a 1 s timeout in `relay.go:Loop()`.
+- **Event loop**: single-threaded, driven by `unix.Poll()` with a 100 ms timeout in `relay_loop.go:Loop()` (remote TCP connections aren't in the poll fd set, so the timeout bounds their latency).
 - **Duplicate suppression**: ring buffer of 256 recent IP checksums prevents re-relaying the same packet.
 - **Remote relay**: TCP transport with 2-byte length-prefixed framing; optional AES-256-GCM via `--aes`.
 - **Interface recovery**: auto-recreates transmit sockets on `ENXIO` errors.
