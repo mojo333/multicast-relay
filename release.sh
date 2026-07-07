@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO="mojo333/multicast-relay"
-TAG="v2.7"
+TAG="v2.8"
 TARGET="master"
 BINDIR="$(mktemp -d)"
 
@@ -22,24 +22,18 @@ file "${BINDIR}"/multicast-relay-*
 echo "==> Creating ${TAG} release on ${TARGET}..."
 NOTES_FILE="${BINDIR}/notes.md"
 cat > "${NOTES_FILE}" <<'EOF'
-## What's Changed since v2.6
+## What's Changed since v2.7
 
 ### Fixes
-- Corrected `maxRemoteMessageLen` to match the worst-case AES-encrypted
-  remote frame size, 10276 bytes, preventing max-size packets from
-  being rejected and dropping the remote connection.
-- `EncryptFrame` now returns an error instead of silently truncating
-  the wire-protocol length prefix if a frame body exceeds 65535 bytes.
-- Fixed a goroutine leak in `dialRemote`: in-flight dial results are
-  now discarded via a select against the relay's shutdown signal
-  instead of blocking forever after the relay closes.
+- `ComputeUDPChecksum` now transmits a computed checksum of 0 as
+  `0xffff`, per RFC 768 (`0x0000` on the wire means "no checksum").
+- Dropped the main event loop's poll timeout from 1000ms to 100ms,
+  bounding the latency of packets arriving over `--remote`/`--listen`
+  TCP mesh connections during local idle.
 
-### Tests
-- Added cipher tests for `EncryptFrame` round-trip and size limits and
-  for the Challenge, Respond, and Verify handshake, raising coverage
-  from 59% to 92.7%.
-- Added relay regression tests for the frame size limit and dial
-  shutdown path.
+### CI
+- Test suite now runs with `-race` to cover the remote-mesh
+  accept/dial goroutines.
 
 ## Binaries
 
