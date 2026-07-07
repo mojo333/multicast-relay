@@ -858,4 +858,81 @@ func TestMdnsSetUnicastBit(t *testing.T) {
 			t.Errorf("class field = 0x%04x, want 0x8001", classField)
 		}
 	})
+
+	t.Run("short payload does not panic", func(t *testing.T) {
+		// A UDP payload shorter than the 12-byte DNS header must be returned
+		// unchanged rather than panicking on the question-count read (udpData[4:6]).
+		for n := 0; n < 12; n++ {
+			dns := make([]byte, n)
+			pkt := buildPacket(dns)
+			result := MdnsSetUnicastBit(pkt, 20)
+			if len(result) != len(pkt) {
+				t.Errorf("payload len %d: expected unchanged packet", n)
+			}
+		}
+	})
+}
+
+func TestCopyIPPayloadRange(t *testing.T) {
+	udpHeader := []byte{1, 2, 3, 4, 5, 6, 7, 8}
+	payload := []byte{10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
+	virtual := append(append([]byte{}, udpHeader...), payload...) // 18 bytes
+
+	cases := []struct{ start, end int }{
+		{0, len(virtual)}, // whole datagram (single fragment)
+		{0, 8},            // exactly the UDP header
+		{0, 5},            // partial header
+		{8, len(virtual)}, // payload only (subsequent fragment)
+		{6, 14},           // straddles header/payload boundary
+		{10, 18},          // within payload
+	}
+	for _, c := range cases {
+		dst := make([]byte, c.end-c.start)
+		copyIPPayloadRange(dst, udpHeader, payload, c.start, c.end)
+		if !bytes.Equal(dst, virtual[c.start:c.end]) {
+			t.Errorf("range [%d:%d] = %v, want %v", c.start, c.end, dst, virtual[c.start:c.end])
+		}
+	}
+}
+
+func TestUDPChecksumZeroBecomesFFFF(t *testing.T) {
+	// RFC 768: a computed UDP checksum of 0x0000 must be transmitted as 0xFFFF.
+	ipHeader := make([]byte, 20)
+	ipHeader[9] = 17 // UDP
+	copy(ipHeader[12:16], net.ParseIP("192.168.1.1").To4())
+	copy(ipHeader[16:20], net.ParseIP("192.168.1.2").To4())
+
+	// Search the 2-byte payload space for an input whose raw checksum is zero,
+	// computed the standard way over the pseudo-header. Then assert ComputeUDPChecksum
+	// emits 0xFFFF instead of 0x0000.
+	found := false
+	for v := 0; v <= 0xffff; v++ {
+		payload := []byte{byte(v >> 8), byte(v)}
+		udpLen := 8 + len(payload)
+		udpHeader := make([]byte, 8)
+		binary.BigEndian.PutUint16(udpHeader[4:6], uint16(udpLen))
+
+		pseudo := make([]byte, 0, 12+udpLen)
+		pseudo = append(pseudo, ipHeader[12:20]...) // src+dst
+		pseudo = append(pseudo, 0, 17)              // zero, proto
+		pseudo = append(pseudo, udpHeader[4:6]...)  // udp length
+		pseudo = append(pseudo, udpHeader...)       // udp header (checksum field 0)
+		pseudo = append(pseudo, payload...)
+		raw := NetChecksum(pseudo)
+
+		got := ComputeUDPChecksum(ipHeader, udpHeader, payload)
+		field := binary.BigEndian.Uint16(got[6:8])
+		if field == 0x0000 {
+			t.Errorf("payload 0x%04x: checksum field is 0x0000, must be 0xFFFF", v)
+		}
+		if raw == 0x0000 {
+			found = true
+			if field != 0xffff {
+				t.Errorf("payload 0x%04x: raw checksum 0, field = 0x%04x, want 0xFFFF", v, field)
+			}
+		}
+	}
+	if !found {
+		t.Skip("no zero-checksum payload found in 2-byte space (fixup path not exercised)")
+	}
 }

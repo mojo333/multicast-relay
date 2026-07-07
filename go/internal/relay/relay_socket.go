@@ -208,16 +208,31 @@ func resolveInterface(spec string) (*InterfaceResult, error) {
 	return nil, fmt.Errorf("interface %s not found", spec)
 }
 
-// getInterface resolves an interface spec and optionally waits for an IPv4 address.
+// getInterface resolves an interface spec, waiting for an IPv4 address if the
+// --wait option is configured. This may block and is only safe to call during
+// startup, before the event loop runs.
 func (pr *PacketRelay) getInterface(iface string) (*InterfaceResult, error) {
+	return pr.resolveInterfaceWait(iface, pr.wait)
+}
+
+// resolveInterfaceWait resolves an interface spec. When wait is true it blocks
+// (checking pr.done) until the interface has an IPv4 address. Callers on the
+// event-loop goroutine (e.g. transmitter recovery) must pass wait=false so a
+// missing address cannot stall the entire relay.
+func (pr *PacketRelay) resolveInterfaceWait(iface string, wait bool) (*InterfaceResult, error) {
 	result, err := resolveInterface(iface)
 	if err != nil {
 		return nil, err
 	}
 
 	// Wait for IPv4 address if configured
-	if pr.wait && !result.Addr.IsValid() {
+	if wait && !result.Addr.IsValid() {
 		for {
+			select {
+			case <-pr.done:
+				return nil, fmt.Errorf("shutting down while waiting for IPv4 address on %s", result.Name)
+			default:
+			}
 			pr.logger.Info("Waiting for IPv4 address on %s", result.Name)
 			time.Sleep(time.Second)
 			result, err = resolveInterface(result.Name)
@@ -248,7 +263,9 @@ func (pr *PacketRelay) getInterface(iface string) (*InterfaceResult, error) {
 // recoverTransmitter attempts to re-create the transmit socket after ENXIO.
 func (pr *PacketRelay) recoverTransmitter(tx *Transmitter, destMac net.HardwareAddr, ipHeaderLength int, data []byte) {
 	pr.logger.Info("Attempting to recover interface %s", tx.Interface)
-	ifInfo, err := pr.getInterface(tx.Interface)
+	// Never wait here: recovery runs on the event-loop goroutine, so blocking
+	// on a missing IPv4 address would stall all relaying and clean shutdown.
+	ifInfo, err := pr.resolveInterfaceWait(tx.Interface, false)
 	if err != nil {
 		pr.logger.Warning("Recovery failed for %s: %s", tx.Interface, err)
 		return
@@ -279,36 +296,39 @@ func (pr *PacketRelay) transmitPacket(tx *Transmitter, destMac net.HardwareAddr,
 
 	dontFragment := (data[6] & 0x40) >> 6
 
-	udpHeader = ComputeUDPChecksum(ipHeader, udpHeader, payload)
+	// Recompute the UDP checksum into a local 8-byte header (no heap allocation).
+	// The IP payload to fragment is the virtual concatenation of newUDPHeader and payload.
+	var newUDPHeader [8]byte
+	copy(newUDPHeader[:], udpHeader[:6])
+	binary.BigEndian.PutUint16(newUDPHeader[6:8], udpChecksumValue(ipHeader, udpHeader, payload))
 
 	hasEther := !bytes.Equal(tx.MAC, zeroMAC)
 
-	// The IP payload is UDP header + UDP data. For fragmentation purposes,
-	// we fragment the entire IP payload (transport header + data).
-	ipPayload := make([]byte, 0, 8+len(payload))
-	ipPayload = append(ipPayload, udpHeader...)
-	ipPayload = append(ipPayload, payload...)
+	ipPayloadLen := 8 + len(payload)
 
 	// Get a scratch buffer large enough for the largest frame: 14 (ether) + IP header + max fragment
-	maxFrameSize := 14 + ipHeaderLength + len(ipPayload)
+	maxFrameSize := 14 + ipHeaderLength + ipPayloadLen
 	scratchBp := getBuffer(maxFrameSize)
 	defer putBuffer(scratchBp)
 	scratch := *scratchBp
 
-	for boundary := 0; boundary < len(ipPayload); boundary += udpMaxLength {
+	for boundary := 0; boundary < ipPayloadLen; boundary += udpMaxLength {
 		end := boundary + udpMaxLength
-		if end > len(ipPayload) {
-			end = len(ipPayload)
+		if end > ipPayloadLen {
+			end = ipPayloadLen
 		}
-		fragment := ipPayload[boundary:end]
-		totalLength := ipHeaderLength + len(fragment)
-		moreFragments := end < len(ipPayload)
+		fragLen := end - boundary
+		totalLength := ipHeaderLength + fragLen
+		moreFragments := end < ipPayloadLen
 
 		// Fragment offset is in 8-byte units per RFC 791
 		flagsOffset := uint16((boundary / 8) & 0x1fff)
 		if moreFragments {
 			flagsOffset |= 0x2000
-		} else if dontFragment != 0 {
+		} else if dontFragment != 0 && boundary == 0 {
+			// Only preserve the Don't-Fragment bit when the datagram fit in a
+			// single fragment. Stamping DF on the tail of a fragment train would
+			// be self-contradictory.
 			flagsOffset |= 0x4000
 		}
 
@@ -323,11 +343,18 @@ func (pr *PacketRelay) transmitPacket(tx *Transmitter, destMac net.HardwareAddr,
 		binary.BigEndian.PutUint16(scratch[etherOff+2:etherOff+4], uint16(totalLength))
 		binary.BigEndian.PutUint16(scratch[etherOff+6:etherOff+8], flagsOffset)
 
-		// Append the fragment data (first fragment includes UDP header, subsequent don't)
-		copy(scratch[etherOff+ipHeaderLength:], fragment)
+		// Copy the fragment data directly from the virtual [newUDPHeader || payload]
+		// range, so the first fragment includes the UDP header and later ones don't.
+		copyIPPayloadRange(scratch[etherOff+ipHeaderLength:], newUDPHeader[:], payload, boundary, end)
 
 		ipPacket := scratch[etherOff : etherOff+totalLength]
 		ComputeIPChecksum(ipPacket, ipHeaderLength)
+
+		// Record the transmitted IP checksum so the relay recognizes this packet
+		// when it loops back on its own listening interface. The dedup ring must
+		// hold the checksum that actually goes on the wire (post TTL/masquerade/
+		// SSDP rewrite), not the pre-modification checksum of the received packet.
+		pr.addChecksum(binary.BigEndian.Uint16(ipPacket[10:12]))
 
 		var frame []byte
 		if hasEther {
@@ -357,9 +384,13 @@ func interfaceIndex(name string) (int, error) {
 	return iface.Index, nil
 }
 
-// createTransmitSocket creates and binds an AF_PACKET raw socket for the named interface.
+// createTransmitSocket creates and binds a send-only AF_PACKET raw socket for the
+// named interface. The socket protocol is 0 (rather than ETH_P_ALL): these sockets
+// are only ever written to, never read or polled, so binding them to ETH_P_ALL
+// would needlessly install a kernel receive tap that clones every packet in and
+// out of the interface into a queue that is never drained.
 func createTransmitSocket(ifName string) (int, error) {
-	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, ethPAllBE)
+	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, 0)
 	if err != nil {
 		return 0, fmt.Errorf("cannot create transmit socket for %s: %w", ifName, err)
 	}
@@ -369,7 +400,7 @@ func createTransmitSocket(ifName string) (int, error) {
 		return 0, fmt.Errorf("cannot get interface index for %s: %w", ifName, err)
 	}
 	sa := &unix.SockaddrLinklayer{
-		Protocol: uint16(ethPAllBE),
+		Protocol: 0,
 		Ifindex:  ifIndex,
 	}
 	if err := unix.Bind(fd, sa); err != nil {

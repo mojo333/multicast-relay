@@ -154,6 +154,16 @@ func run() int {
 	log.Monitor("Process started (pid %d, version %s)", os.Getpid(), version)
 	log.Monitor("Parameters: %s", formatArgs())
 
+	// Warn loudly when remote relay is used without encryption: without --aes
+	// there is no cryptographic authentication of remote peers, and any host that
+	// can reach the port from an allowed source IP can inject packets onto local
+	// networks.
+	if (len(listenAddrs) > 0 || len(remoteAddrs) > 0) && aesKeyVal == "" {
+		warn := "Remote relay is running WITHOUT encryption (--aes). Remote peers are not cryptographically authenticated; use --aes with a strong shared key on untrusted networks."
+		log.Warning("%s", warn)
+		log.Monitor("%s", warn)
+	}
+
 	// Build relay set
 	type relayEntry struct {
 		addrPort string
@@ -327,6 +337,13 @@ func dropPrivileges(username string) error {
 	uid, err := strconv.Atoi(u.Uid)
 	if err != nil {
 		return fmt.Errorf("invalid UID %q for user %q: %w", u.Uid, username, err)
+	}
+	// Drop inherited supplementary groups before changing gid/uid. Without this,
+	// the process keeps root's supplementary group memberships (potentially
+	// including gid 0) after the drop, leaving privileges the "unprivileged" user
+	// should not hold.
+	if err := syscall.Setgroups([]int{gid}); err != nil {
+		return fmt.Errorf("setgroups(%d): %w", gid, err)
 	}
 	if err := syscall.Setgid(gid); err != nil {
 		return fmt.Errorf("setgid(%d): %w", gid, err)
