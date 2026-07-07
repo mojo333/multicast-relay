@@ -672,6 +672,23 @@ func TestComputeUDPChecksum(t *testing.T) {
 			t.Errorf("UDP checksum = 0x%04x, want 0x3e62", gotChecksum)
 		}
 	})
+
+	t.Run("zero-valued checksum is transmitted as 0xffff", func(t *testing.T) {
+		// Crafted so the one's-complement sum before inversion is exactly
+		// 0xffff, so the computed checksum inverts to 0x0000. RFC 768
+		// requires that be sent as 0xffff, since 0x0000 on the wire means
+		// "no checksum".
+		ipHeader := make([]byte, 20)
+		ipHeader[9] = 17 // protocol = UDP
+		udpHeader := []byte{0x00, 0x00, 0xff, 0xde, 0x00, 0x08, 0x00, 0x00}
+		var data []byte
+
+		result := ComputeUDPChecksum(ipHeader, udpHeader, data)
+		gotChecksum := binary.BigEndian.Uint16(result[6:8])
+		if gotChecksum != 0xffff {
+			t.Errorf("UDP checksum = 0x%04x, want 0xffff", gotChecksum)
+		}
+	})
 }
 
 func TestOnNetworkPrefix(t *testing.T) {

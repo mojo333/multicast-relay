@@ -75,7 +75,7 @@ func (pr *PacketRelay) Loop() error {
 			pr.pollFds[i].Revents = 0
 		}
 
-		n, err := unix.Poll(pr.pollFds, 1000) // 1 second timeout
+		n, err := unix.Poll(pr.pollFds, 100) // 100ms timeout; bounds remote-mesh read latency
 		if err != nil {
 			if err == unix.EINTR {
 				continue
