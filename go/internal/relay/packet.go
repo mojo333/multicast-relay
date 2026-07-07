@@ -77,6 +77,11 @@ func ComputeUDPChecksum(ipHeader, udpHeader, data []byte) []byte {
 	sum = checksumAdd(sum, data)
 
 	checksum := checksumFinalize(sum)
+	if checksum == 0 {
+		// RFC 768: a computed checksum of 0 must be transmitted as all-ones;
+		// 0x0000 on the wire means "no checksum".
+		checksum = 0xffff
+	}
 
 	result := make([]byte, 8)
 	copy(result, udpHeader[:6])
