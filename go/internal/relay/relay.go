@@ -4,6 +4,7 @@ package relay
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -34,18 +35,37 @@ const (
 
 	// ethPAllBE is ETH_P_ALL in network byte order (big-endian).
 	ethPAllBE = (unix.ETH_P_ALL>>8)&0xff | (unix.ETH_P_ALL&0xff)<<8
+
+	// remoteWriteTimeout bounds a single write to a remote peer inside its writer
+	// goroutine. remoteWriteQueueLen bounds how many frames may be buffered for a
+	// slow peer before new frames are dropped.
+	remoteWriteTimeout  = 100 * time.Millisecond
+	remoteWriteQueueLen = 256
+
+	// arpCacheTTL is how long a resolved IP→MAC mapping is reused before the ARP
+	// table is re-read for SSDP unicast reply routing.
+	arpCacheTTL = 10 * time.Second
 )
 
 const (
 	// maxPacketSize is the maximum expected packet size for pooled buffers.
 	maxPacketSize = 10240
 
+	// maxFrameBufferSize is the largest transmit scratch buffer: a full-size IP
+	// packet plus the 14-byte ethernet header. Pooled buffers are sized to this
+	// so full-size frames never fall outside the pool's capacity.
+	maxFrameBufferSize = 14 + maxPacketSize
+
 	minUDPPacketLen = 28 // min IP(20)+UDP(8) header
 
 	// maxRemoteMessageLen caps the remote TCP framing length prefix. The frame
-	// body is magic(4) + senderIP(4) + packet(<=maxPacketSize), plus GCM
+	// body is seq(8) + magic(4) + senderIP(4) + packet(<=maxPacketSize), plus GCM
 	// nonce(12) + tag(16) when AES is enabled.
-	maxRemoteMessageLen = maxPacketSize + 4 + 4 + 12 + 16
+	maxRemoteMessageLen = maxPacketSize + remoteHeaderLen + 12 + 16
+
+	// remoteHeaderLen is the fixed remote-frame plaintext header preceding the
+	// relayed IP packet: seq(8) + magic(4) + senderIP(4).
+	remoteHeaderLen = 8 + len(magicBytes) + 4
 )
 
 var (
@@ -62,7 +82,7 @@ var (
 	// packetPool provides reusable byte buffers for packet processing.
 	packetPool = sync.Pool{
 		New: func() interface{} {
-			b := make([]byte, 0, maxPacketSize)
+			b := make([]byte, 0, maxFrameBufferSize)
 			return &b
 		},
 	}
@@ -122,7 +142,9 @@ func New(cfg Config) (*PacketRelay, error) {
 		masquerade:           masq,
 		logger:               cfg.Logger,
 		etherAddrs:           make(map[netip.Addr]net.HardwareAddr),
-		remoteReadBufs:       make(map[net.Conn]*remoteReadBuf),
+		remoteWriters:        make(map[net.Conn]*remoteWriter),
+		remotePacketCh:       make(chan remotePacket, 256),
+		remoteFailedCh:       make(chan net.Conn, 16),
 		listenAddr:           cfg.Listen,
 		remotePort:           cfg.RemotePort,
 		remoteRetry:          cfg.RemoteRetry,
@@ -131,7 +153,6 @@ func New(cfg Config) (*PacketRelay, error) {
 		connsDirty:           true,
 		pollDirty:            true,
 		done:                 make(chan struct{}),
-		remoteTmpBuf:         make([]byte, 4096),
 	}
 
 	if cfg.Remote != nil {
@@ -236,7 +257,9 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr netip.Addr, receivi
 		return
 	}
 
-	// Dedup check FIRST using the original received checksum, before any modification.
+	// Dedup on both checksums: the received one (recorded here) stops a remote
+	// peer bouncing the unmodified packet back, and the transmitted one (recorded
+	// in transmitPacket) stops our rewritten packet looping on a local interface.
 	ipChecksum := binary.BigEndian.Uint16(data[10:12])
 	if pr.isDuplicate(ipChecksum) {
 		return
@@ -253,27 +276,23 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr netip.Addr, receivi
 	remotes := pr.remoteSockets()
 	if len(remotes) > 0 && !(receivingInterface == "remote" && pr.noRemoteRelay) {
 		senderIPBytes := senderAddr.As4()
-		packet := make([]byte, 0, len(magicBytes)+4+len(data))
+		seq := pr.remoteSeq
+		pr.remoteSeq++
+		// Frame plaintext: seq(8) || magic(4) || senderIP(4) || packet.
+		// The sequence number lets the peer reject replayed frames.
+		packet := make([]byte, 0, remoteHeaderLen+len(data))
+		var seqBytes [8]byte
+		binary.BigEndian.PutUint64(seqBytes[:], seq)
+		packet = append(packet, seqBytes[:]...)
 		packet = append(packet, magicBytes[:]...)
 		packet = append(packet, senderIPBytes[:]...)
 		packet = append(packet, data...)
 
-		frame, err := pr.aes.EncryptFrame(packet)
-		if err == nil {
-			var failed []net.Conn
-			for _, conn := range remotes {
-				conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
-				_, werr := conn.Write(frame)
-				conn.SetWriteDeadline(time.Time{})
-				if werr != nil {
-					pr.logger.Warning("REMOTE: Write error to %s: %s", conn.RemoteAddr(), werr)
-					failed = append(failed, conn)
-				}
-			}
-			for _, conn := range failed {
-				pr.removeConnection(conn)
-				conn.Close()
-			}
+		// Hand the packet to each connection's writer goroutine instead of
+		// writing inline: a slow or stalled remote peer must never block the
+		// single-threaded event loop and stall local relaying.
+		for _, conn := range remotes {
+			pr.queueRemoteFrame(conn, packet)
 		}
 	}
 
@@ -306,6 +325,12 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr netip.Addr, receivi
 	broadcastPacket := false
 	if receivingInterface == "local" {
 		receivingInterface, broadcastPacket = pr.findReceivingIface(senderAddr, origDstAddr, origDstPort)
+	} else if receivingInterface == "remote" {
+		// A broadcast packet arriving over the remote relay carries the sending
+		// site's subnet broadcast as its destination, which never equals any
+		// local interface's broadcast. Recognize it here so it can be re-broadcast
+		// onto local interfaces instead of being silently dropped.
+		broadcastPacket = pr.isRemoteBroadcast(origDstAddr, origDstPort)
 	}
 
 	// Relay to all other interfaces
@@ -341,32 +366,44 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr netip.Addr, receivi
 				continue
 			}
 
-			txBp := getBuffer(len(data))
-			txData := *txBp
-			copy(txData, data)
-
+			// Only take a private copy when an address is rewritten; otherwise
+			// transmitPacket reads data without mutating it, so the received buffer
+			// can be passed through directly.
 			isMasq := pr.masquerade[tx.Interface]
-			if isMasq {
-				addrBytes := tx.Addr.As4()
-				copy(txData[12:16], addrBytes[:])
+			txData := data
+			var txBp *[]byte
+			if isMasq || broadcastPacket {
+				txBp = getBuffer(len(data))
+				txData = *txBp
+				copy(txData, data)
+				if isMasq {
+					addrBytes := tx.Addr.As4()
+					copy(txData[12:16], addrBytes[:])
+				}
+				if broadcastPacket {
+					bcastBytes := tx.Broadcast.As4()
+					copy(txData[16:20], bcastBytes[:])
+				}
 			}
 
-			servicePrefix := ""
-			if tx.Service != "" {
-				servicePrefix = fmt.Sprintf("[%s] ", tx.Service)
+			if pr.logger.InfoEnabled() {
+				servicePrefix := ""
+				if tx.Service != "" {
+					servicePrefix = fmt.Sprintf("[%s] ", tx.Service)
+				}
+				action := "Relayed"
+				if isMasq {
+					action = "Masqueraded"
+				}
+				plural := "s"
+				if len(txData) == 1 {
+					plural = ""
+				}
+				pr.logger.Info("%s%s %d byte%s from %s:%d on %s [ttl %d] to %s:%d via %s/%s",
+					servicePrefix, action, len(txData), plural,
+					srcAddr, srcPort, receivingInterface, ttl,
+					localDstAddr, dstPort, tx.Interface, tx.Addr)
 			}
-			action := "Relayed"
-			if isMasq {
-				action = "Masqueraded"
-			}
-			plural := "s"
-			if len(txData) == 1 {
-				plural = ""
-			}
-			pr.logger.Info("%s%s %d byte%s from %s:%d on %s [ttl %d] to %s:%d via %s/%s",
-				servicePrefix, action, len(txData), plural,
-				srcAddr, srcPort, receivingInterface, ttl,
-				localDstAddr, dstPort, tx.Interface, tx.Addr)
 
 			if err := pr.transmitPacket(tx, localDestMac, ipHeaderLength, txData); err != nil {
 				// Try to recover if ENXIO (device not configured)
@@ -376,7 +413,9 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr netip.Addr, receivi
 					pr.logger.Warning("Error sending packet: %s", err)
 				}
 			}
-			putBuffer(txBp)
+			if txBp != nil {
+				putBuffer(txBp)
+			}
 		}
 	}
 }
@@ -419,20 +458,40 @@ func (pr *PacketRelay) handleSSDP(data []byte, ipHeaderLength int, srcAddr netip
 
 		outData = ModifyUDPPacket(data, ipHeaderLength, netip.Addr{}, 0, outDstAddr, outDstPort)
 
-		macStr, err := UnicastIPToMAC(outDstAddr.String(), "")
-		if err != nil || macStr == "" {
+		destMac, err := pr.resolveUnicastMAC(outDstAddr)
+		if err != nil || destMac == nil {
 			pr.logger.Info("Could not resolve MAC for %s", outDstAddr)
 			drop = true
-			return
+			return outData, outSrcAddr, outSrcPort, outDstAddr, outDstPort, nil, true
 		}
-		destMac, err = net.ParseMAC(macStr)
-		if err != nil {
-			pr.logger.Info("Could not parse MAC %s: %s", macStr, err)
-			drop = true
-			return
-		}
+		return outData, outSrcAddr, outSrcPort, outDstAddr, outDstPort, destMac, false
 	}
 	return
+}
+
+// resolveUnicastMAC resolves an IP to a MAC via the ARP table, caching the most
+// recent lookup for a short TTL. SSDP unicast replies arrive in bursts to the
+// same source, so this avoids re-reading and re-parsing /proc/net/arp per packet.
+// Called only from the main loop goroutine.
+func (pr *PacketRelay) resolveUnicastMAC(ip netip.Addr) (net.HardwareAddr, error) {
+	ipStr := ip.String()
+	now := time.Now()
+	if pr.arpCacheMAC != nil && pr.arpCacheIP == ipStr && now.Sub(pr.arpCacheTime) < arpCacheTTL {
+		return pr.arpCacheMAC, nil
+	}
+	macStr, err := UnicastIPToMAC(ipStr, "")
+	if err != nil || macStr == "" {
+		return nil, err
+	}
+	mac, err := net.ParseMAC(macStr)
+	if err != nil {
+		pr.logger.Info("Could not parse MAC %s: %s", macStr, err)
+		return nil, err
+	}
+	pr.arpCacheIP = ipStr
+	pr.arpCacheMAC = mac
+	pr.arpCacheTime = now
+	return mac, nil
 }
 
 // findReceivingIface identifies which local interface received a packet based on destination.
@@ -446,6 +505,86 @@ func (pr *PacketRelay) findReceivingIface(senderAddr, origDstAddr netip.Addr, or
 		}
 	}
 	return
+}
+
+// isRemoteBroadcast reports whether a packet arriving over the remote relay is a
+// broadcast that should be re-broadcast onto local interfaces. Remote packets are
+// only ever forwarded because they matched a relay rule on the sender, so any
+// non-multicast packet whose destination port matches a configured broadcast
+// transmitter (Relay.Addr == the interface broadcast) is a relayed broadcast.
+func (pr *PacketRelay) isRemoteBroadcast(origDstAddr netip.Addr, origDstPort uint16) bool {
+	if origDstAddr.IsMulticast() {
+		return false
+	}
+	for i := range pr.transmitters {
+		tx := &pr.transmitters[i]
+		if int(origDstPort) == tx.Relay.Port && tx.Relay.Addr == tx.Broadcast {
+			return true
+		}
+	}
+	return false
+}
+
+// queueRemoteFrame hands a frame's plaintext to the connection's writer goroutine
+// via a bounded queue. If the queue is full (a slow or stalled peer), the frame is
+// dropped rather than blocking the event loop, as discovery traffic tolerates loss.
+// The plaintext is shared between writers, so it must not be modified. The writer
+// goroutine is created lazily on first use. Called only from the main loop
+// goroutine, so remoteWriters access needs no locking.
+func (pr *PacketRelay) queueRemoteFrame(conn net.Conn, plaintext []byte) {
+	w := pr.remoteWriters[conn]
+	if w == nil {
+		w = &remoteWriter{conn: conn, ch: make(chan []byte, remoteWriteQueueLen), done: make(chan struct{})}
+		pr.remoteWriters[conn] = w
+		go pr.runWriter(w)
+	}
+	select {
+	case w.ch <- plaintext:
+	default:
+		pr.logger.Info("REMOTE: Write queue full for %s — dropping frame", conn.RemoteAddr())
+	}
+}
+
+// runWriter drains a connection's frame queue, encrypts each frame and writes it
+// to the socket. On a write error it closes the connection; the main loop's
+// reader observes the closure and cleans up. Exits when the connection is removed
+// or the relay stops.
+func (pr *PacketRelay) runWriter(w *remoteWriter) {
+	aes, _ := pr.connCiphers(w.conn)
+	for {
+		select {
+		case <-w.done:
+			return
+		case <-pr.done:
+			return
+		case plaintext := <-w.ch:
+			frame, err := aes.EncryptFrame(plaintext)
+			if err != nil {
+				pr.logger.Warning("REMOTE: Cannot frame packet for %s: %s", w.conn.RemoteAddr(), err)
+				continue
+			}
+			w.conn.SetWriteDeadline(time.Now().Add(remoteWriteTimeout))
+			_, err = w.conn.Write(frame)
+			w.conn.SetWriteDeadline(time.Time{})
+			if err != nil {
+				// net.ErrClosed means we closed it ourselves, which is not a fault.
+				if !errors.Is(err, net.ErrClosed) {
+					pr.logger.Warning("REMOTE: Write error to %s: %s", w.conn.RemoteAddr(), err)
+				}
+				w.conn.Close()
+				return
+			}
+		}
+	}
+}
+
+// stopWriter tears down a connection's writer goroutine, if any.
+// Called only from the main loop goroutine.
+func (pr *PacketRelay) stopWriter(conn net.Conn) {
+	if w := pr.remoteWriters[conn]; w != nil {
+		close(w.done)
+		delete(pr.remoteWriters, conn)
+	}
 }
 
 // isDuplicate checks whether this checksum was recently seen.

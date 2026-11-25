@@ -88,6 +88,10 @@ are specified, then one can also specify just one local interface with --interfa
 `--aes` use the specified string to encrypt/decrypt data packets sent to remote
 relays. Can also be set via the `MULTICAST_RELAY_AES_KEY` environment variable.
 
+**Upgrading from v2.8 or earlier:** the remote protocol has changed, with or
+without `--aes`, so every `--listen` and `--remote` peer must be upgraded at the
+same time. Mixed versions do not relay to each other.
+
 `--drop-user` drop root privileges to this unprivileged user after socket setup
 (Linux only, requires starting as root).
 

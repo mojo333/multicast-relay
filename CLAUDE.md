@@ -8,7 +8,7 @@ A Go reimplementation of Al Smith's Python multicast-relay. Relays broadcast and
 go/
   cmd/multicast-relay/main.go       # CLI entry point, flag parsing, signal handling
   internal/relay/relay.go           # PacketRelay struct, constructor, top-level setup
-  internal/relay/relay_types.go     # Shared relay types (remoteReadBuf, etc.)
+  internal/relay/relay_types.go     # Shared relay types (PacketRelay, sessionConn, etc.)
   internal/relay/relay_loop.go      # Loop(): unix.Poll()-driven event loop
   internal/relay/relay_socket.go    # AddListener: receive/transmit socket setup, multicast/broadcast join
   internal/relay/relay_remote.go    # Remote TCP mesh: framing, read/dispatch of remote connections
@@ -48,9 +48,9 @@ Releases are published with `./release.sh` (requires `gh` CLI).
 ## Key Architecture Notes
 
 - **Raw sockets**: uses `AF_PACKET` sockets for packet capture and transmission (Linux only).
-- **Event loop**: single-threaded, driven by `unix.Poll()` with a 100 ms timeout in `relay_loop.go:Loop()` (remote TCP connections aren't in the poll fd set, so the timeout bounds their latency).
-- **Duplicate suppression**: ring buffer of 256 recent IP checksums prevents re-relaying the same packet.
-- **Remote relay**: TCP transport with 2-byte length-prefixed framing; optional AES-256-GCM via `--aes`.
+- **Event loop**: single-threaded, driven by `unix.Poll()` in `relay_loop.go:Loop()`. The timeout is 1 s, or 100 ms when a remote relay is configured, because remote packets arrive on a channel rather than the poll fd set and the timeout bounds their latency.
+- **Duplicate suppression**: ring buffer of 256 recent IP checksums, recording both received and transmitted values, prevents re-relaying the same packet.
+- **Remote relay**: TCP transport with 2-byte length-prefixed framing and a reader and writer goroutine per connection; optional AES-256-GCM via `--aes`, with mutual authentication and per-connection, per-direction session keys.
 - **Interface recovery**: auto-recreates transmit sockets on `ENXIO` errors.
 - **Buffer reuse**: `sync.Pool` for packet buffers.
 - **Module**: `github.com/mojo333/multicast-relay`, Go 1.24, single external dependency `golang.org/x/sys`.

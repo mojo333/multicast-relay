@@ -5,12 +5,28 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
+	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+)
+
+// Key derivation parameters. PBKDF2-HMAC-SHA256 with a high iteration count
+// gives the passphrase a work factor, so a low-entropy shared key is no longer
+// trivially brute-forceable from a captured frame or handshake. The salts are
+// fixed (both relay ends derive the same key from the same passphrase) but
+// distinct, providing domain separation between the AES and HMAC keys.
+const (
+	kdfIterations = 210_000
+	kdfKeyLen     = 32
+)
+
+var (
+	aesKDFSalt  = []byte("multicast-relay-kdf-aes-v1")
+	hmacKDFSalt = []byte("multicast-relay-kdf-hmac-v1")
 )
 
 // Cipher handles AES-256-GCM authenticated encryption and HMAC-based peer authentication.
@@ -23,51 +39,77 @@ type Cipher struct {
 }
 
 // New creates a new Cipher. If key is empty, encryption is disabled (passthrough).
-// When key is non-empty, two separate keys are derived via SHA-256 with domain separation:
-//   - AES key:  SHA-256(passphrase)
-//   - HMAC key: SHA-256("multicast-relay-auth-v1:" + passphrase)
+// When key is non-empty, two separate 256-bit keys are derived from the passphrase
+// via PBKDF2-HMAC-SHA256 with distinct salts for domain separation:
+//   - AES key:  PBKDF2(passphrase, aesKDFSalt)
+//   - HMAC key: PBKDF2(passphrase, hmacKDFSalt)
 func New(key string) (*Cipher, error) {
 	c := &Cipher{}
 	if key == "" {
 		return c, nil
 	}
 
-	keyBytes := []byte(key)
+	// Derive the AES-256 key and zero it immediately after loading into the block cipher.
+	aesKey, err := pbkdf2.Key(sha256.New, key, aesKDFSalt, kdfIterations, kdfKeyLen)
+	if err != nil {
+		return nil, fmt.Errorf("cipher: failed to derive AES key: %w", err)
+	}
+	gcm, err := newGCM(aesKey)
+	if err != nil {
+		return nil, err
+	}
 
-	// Derive AES-256 key and zero the intermediate hash immediately after loading into the block cipher.
-	aesHash := sha256.Sum256(keyBytes)
-	block, err := aes.NewCipher(aesHash[:])
-	for i := range aesHash {
-		aesHash[i] = 0
+	// Derive the HMAC key with a distinct salt so AES key ≠ HMAC key for the same passphrase.
+	hmacKey, err := pbkdf2.Key(sha256.New, key, hmacKDFSalt, kdfIterations, kdfKeyLen)
+	if err != nil {
+		return nil, fmt.Errorf("cipher: failed to derive HMAC key: %w", err)
+	}
+
+	c.gcm = gcm
+	c.hmacKey = hmacKey
+	c.enabled = true
+	return c, nil
+}
+
+// newGCM builds an AES-256-GCM AEAD and zeroes the key once it is loaded.
+func newGCM(key []byte) (cipher.AEAD, error) {
+	block, err := aes.NewCipher(key)
+	for i := range key {
+		key[i] = 0
 	}
 	if err != nil {
 		return nil, fmt.Errorf("cipher: failed to create AES block: %w", err)
 	}
-
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
 		return nil, fmt.Errorf("cipher: failed to create GCM: %w", err)
 	}
+	return gcm, nil
+}
 
-	// Derive HMAC key with explicit domain separation so AES key ≠ HMAC key for the same passphrase.
-	hmacInput := append([]byte("multicast-relay-auth-v1:"), keyBytes...)
-	hmacHash := sha256.Sum256(hmacInput)
-	for i := range hmacInput {
-		hmacInput[i] = 0
+// Session derives the encryption keys for one authenticated connection from both
+// handshake challenges, one key per direction. A frame therefore cannot be
+// replayed on another connection or reflected back to its sender. Respond only
+// ever signs 16-byte challenges for a peer, so the longer, labelled input used
+// here cannot be obtained through the handshake.
+func (c *Cipher) Session(serverChallenge, clientChallenge []byte) (toServer, toClient *Cipher, err error) {
+	derive := func(direction string) (*Cipher, error) {
+		input := []byte("multicast-relay-session-v1:" + direction)
+		input = append(input, serverChallenge...)
+		input = append(input, clientChallenge...)
+		gcm, err := newGCM(c.Respond(input))
+		if err != nil {
+			return nil, err
+		}
+		return &Cipher{gcm: gcm, enabled: true}, nil
 	}
-	for i := range keyBytes {
-		keyBytes[i] = 0
+	if toServer, err = derive("to-server"); err != nil {
+		return nil, nil, err
 	}
-
-	c.gcm = gcm
-	c.hmacKey = make([]byte, len(hmacHash))
-	copy(c.hmacKey, hmacHash[:])
-	for i := range hmacHash {
-		hmacHash[i] = 0
+	if toClient, err = derive("to-client"); err != nil {
+		return nil, nil, err
 	}
-
-	c.enabled = true
-	return c, nil
+	return toServer, toClient, nil
 }
 
 // Enabled reports whether encryption and peer authentication are active.

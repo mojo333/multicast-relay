@@ -138,8 +138,19 @@ func (l *Logger) Monitor(format string, args ...interface{}) {
 	}
 }
 
+// InfoEnabled reports whether Info-level messages are emitted. Callers on hot
+// paths should guard expensive argument formatting with this check.
+func (l *Logger) InfoEnabled() bool {
+	return l.slog.Enabled(context.Background(), slog.LevelInfo)
+}
+
 // Info logs an informational message (only emitted when verbose is enabled).
+// The format arguments are only evaluated when Info level is enabled, so callers
+// pay no formatting cost in the default (non-verbose) configuration.
 func (l *Logger) Info(format string, args ...interface{}) {
+	if !l.slog.Enabled(context.Background(), slog.LevelInfo) {
+		return
+	}
 	l.slog.Info(fmt.Sprintf(format, args...))
 }
 

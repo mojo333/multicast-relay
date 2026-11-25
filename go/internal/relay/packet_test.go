@@ -875,4 +875,39 @@ func TestMdnsSetUnicastBit(t *testing.T) {
 			t.Errorf("class field = 0x%04x, want 0x8001", classField)
 		}
 	})
+
+	t.Run("short payload does not panic", func(t *testing.T) {
+		// A UDP payload shorter than the 12-byte DNS header must be returned
+		// unchanged rather than panicking on the question-count read (udpData[4:6]).
+		for n := 0; n < 12; n++ {
+			dns := make([]byte, n)
+			pkt := buildPacket(dns)
+			result := MdnsSetUnicastBit(pkt, 20)
+			if len(result) != len(pkt) {
+				t.Errorf("payload len %d: expected unchanged packet", n)
+			}
+		}
+	})
+}
+
+func TestCopyIPPayloadRange(t *testing.T) {
+	udpHeader := []byte{1, 2, 3, 4, 5, 6, 7, 8}
+	payload := []byte{10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
+	virtual := append(append([]byte{}, udpHeader...), payload...) // 18 bytes
+
+	cases := []struct{ start, end int }{
+		{0, len(virtual)}, // whole datagram (single fragment)
+		{0, 8},            // exactly the UDP header
+		{0, 5},            // partial header
+		{8, len(virtual)}, // payload only (subsequent fragment)
+		{6, 14},           // straddles header/payload boundary
+		{10, 18},          // within payload
+	}
+	for _, c := range cases {
+		dst := make([]byte, c.end-c.start)
+		copyIPPayloadRange(dst, udpHeader, payload, c.start, c.end)
+		if !bytes.Equal(dst, virtual[c.start:c.end]) {
+			t.Errorf("range [%d:%d] = %v, want %v", c.start, c.end, dst, virtual[c.start:c.end])
+		}
+	}
 }
