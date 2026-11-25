@@ -19,7 +19,7 @@ jobs:
 
       - name: Run tests
         working-directory: go
-        run: go test ./... -v -count=1
+        run: go test ./... -v -count=1 -race
 
       - name: Run vet
         working-directory: go
