@@ -18,9 +18,17 @@ type remotePacket struct {
 	data       []byte
 }
 
+// sessionConn is an authenticated remote connection together with the keys that
+// are valid for it alone, one per direction.
+type sessionConn struct {
+	net.Conn
+	send, recv *cipher.Cipher
+}
+
 // remoteWriter owns the writer goroutine for a single remote connection.
-// The event loop enqueues frames on ch; the goroutine writes them so a slow
-// peer cannot block the loop. done is closed to stop the goroutine.
+// The event loop enqueues plaintext frames on ch; the goroutine encrypts and
+// writes them so a slow peer cannot block the loop. done is closed to stop the
+// goroutine.
 type remoteWriter struct {
 	conn net.Conn
 	ch   chan []byte

@@ -54,17 +54,9 @@ func New(key string) (*Cipher, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cipher: failed to derive AES key: %w", err)
 	}
-	block, err := aes.NewCipher(aesKey)
-	for i := range aesKey {
-		aesKey[i] = 0
-	}
+	gcm, err := newGCM(aesKey)
 	if err != nil {
-		return nil, fmt.Errorf("cipher: failed to create AES block: %w", err)
-	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, fmt.Errorf("cipher: failed to create GCM: %w", err)
+		return nil, err
 	}
 
 	// Derive the HMAC key with a distinct salt so AES key ≠ HMAC key for the same passphrase.
@@ -77,6 +69,47 @@ func New(key string) (*Cipher, error) {
 	c.hmacKey = hmacKey
 	c.enabled = true
 	return c, nil
+}
+
+// newGCM builds an AES-256-GCM AEAD and zeroes the key once it is loaded.
+func newGCM(key []byte) (cipher.AEAD, error) {
+	block, err := aes.NewCipher(key)
+	for i := range key {
+		key[i] = 0
+	}
+	if err != nil {
+		return nil, fmt.Errorf("cipher: failed to create AES block: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("cipher: failed to create GCM: %w", err)
+	}
+	return gcm, nil
+}
+
+// Session derives the encryption keys for one authenticated connection from both
+// handshake challenges, one key per direction. A frame therefore cannot be
+// replayed on another connection or reflected back to its sender. Respond only
+// ever signs 16-byte challenges for a peer, so the longer, labelled input used
+// here cannot be obtained through the handshake.
+func (c *Cipher) Session(serverChallenge, clientChallenge []byte) (toServer, toClient *Cipher, err error) {
+	derive := func(direction string) (*Cipher, error) {
+		input := []byte("multicast-relay-session-v1:" + direction)
+		input = append(input, serverChallenge...)
+		input = append(input, clientChallenge...)
+		gcm, err := newGCM(c.Respond(input))
+		if err != nil {
+			return nil, err
+		}
+		return &Cipher{gcm: gcm, enabled: true}, nil
+	}
+	if toServer, err = derive("to-server"); err != nil {
+		return nil, nil, err
+	}
+	if toClient, err = derive("to-client"); err != nil {
+		return nil, nil, err
+	}
+	return toServer, toClient, nil
 }
 
 // Enabled reports whether encryption and peer authentication are active.

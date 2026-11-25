@@ -4,6 +4,7 @@ package relay
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -256,16 +257,14 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr netip.Addr, receivi
 		return
 	}
 
-	// Dedup: drop the packet if its IP checksum matches one we recently put on
-	// the wire ourselves (see transmitPacket, which records transmitted
-	// checksums). This suppresses the relay's own retransmissions looping back on
-	// a listening interface. The received checksum is only checked, never
-	// recorded here — recording it would not match the modified packet we later
-	// transmit (e.g. after a TTL or masquerade rewrite).
+	// Dedup on both checksums: the received one (recorded here) stops a remote
+	// peer bouncing the unmodified packet back, and the transmitted one (recorded
+	// in transmitPacket) stops our rewritten packet looping on a local interface.
 	ipChecksum := binary.BigEndian.Uint16(data[10:12])
 	if pr.isDuplicate(ipChecksum) {
 		return
 	}
+	pr.addChecksum(ipChecksum)
 
 	// IP header length
 	ipHeaderLength := int(data[0]&0x0f) * 4
@@ -289,14 +288,11 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr netip.Addr, receivi
 		packet = append(packet, senderIPBytes[:]...)
 		packet = append(packet, data...)
 
-		frame, err := pr.aes.EncryptFrame(packet)
-		if err == nil {
-			// Hand the frame to each connection's writer goroutine instead of
-			// writing inline: a slow or stalled remote peer must never block the
-			// single-threaded event loop and stall local relaying.
-			for _, conn := range remotes {
-				pr.queueRemoteFrame(conn, frame)
-			}
+		// Hand the packet to each connection's writer goroutine instead of
+		// writing inline: a slow or stalled remote peer must never block the
+		// single-threaded event loop and stall local relaying.
+		for _, conn := range remotes {
+			pr.queueRemoteFrame(conn, packet)
 		}
 	}
 
@@ -370,18 +366,24 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr netip.Addr, receivi
 				continue
 			}
 
-			// Only take a private copy when masquerading rewrites the source
-			// address; otherwise transmitPacket reads data without mutating it, so
-			// the received buffer can be passed through directly.
+			// Only take a private copy when an address is rewritten; otherwise
+			// transmitPacket reads data without mutating it, so the received buffer
+			// can be passed through directly.
 			isMasq := pr.masquerade[tx.Interface]
 			txData := data
 			var txBp *[]byte
-			if isMasq {
+			if isMasq || broadcastPacket {
 				txBp = getBuffer(len(data))
 				txData = *txBp
 				copy(txData, data)
-				addrBytes := tx.Addr.As4()
-				copy(txData[12:16], addrBytes[:])
+				if isMasq {
+					addrBytes := tx.Addr.As4()
+					copy(txData[12:16], addrBytes[:])
+				}
+				if broadcastPacket {
+					bcastBytes := tx.Broadcast.As4()
+					copy(txData[16:20], bcastBytes[:])
+				}
 			}
 
 			if pr.logger.InfoEnabled() {
@@ -523,12 +525,13 @@ func (pr *PacketRelay) isRemoteBroadcast(origDstAddr netip.Addr, origDstPort uin
 	return false
 }
 
-// queueRemoteFrame hands a wire frame to the connection's writer goroutine via a
-// bounded queue. If the queue is full (a slow or stalled peer), the frame is
-// dropped rather than blocking the event loop — discovery traffic tolerates loss.
-// The writer goroutine is created lazily on first use. Called only from the main
-// loop goroutine, so remoteWriters access needs no locking.
-func (pr *PacketRelay) queueRemoteFrame(conn net.Conn, frame []byte) {
+// queueRemoteFrame hands a frame's plaintext to the connection's writer goroutine
+// via a bounded queue. If the queue is full (a slow or stalled peer), the frame is
+// dropped rather than blocking the event loop, as discovery traffic tolerates loss.
+// The plaintext is shared between writers, so it must not be modified. The writer
+// goroutine is created lazily on first use. Called only from the main loop
+// goroutine, so remoteWriters access needs no locking.
+func (pr *PacketRelay) queueRemoteFrame(conn net.Conn, plaintext []byte) {
 	w := pr.remoteWriters[conn]
 	if w == nil {
 		w = &remoteWriter{conn: conn, ch: make(chan []byte, remoteWriteQueueLen), done: make(chan struct{})}
@@ -536,27 +539,38 @@ func (pr *PacketRelay) queueRemoteFrame(conn net.Conn, frame []byte) {
 		go pr.runWriter(w)
 	}
 	select {
-	case w.ch <- frame:
+	case w.ch <- plaintext:
 	default:
 		pr.logger.Info("REMOTE: Write queue full for %s — dropping frame", conn.RemoteAddr())
 	}
 }
 
-// runWriter drains a connection's frame queue and writes frames to the socket.
-// On a write error it closes the connection; the main loop's reader observes the
-// closure and cleans up. Exits when the connection is removed or the relay stops.
+// runWriter drains a connection's frame queue, encrypts each frame and writes it
+// to the socket. On a write error it closes the connection; the main loop's
+// reader observes the closure and cleans up. Exits when the connection is removed
+// or the relay stops.
 func (pr *PacketRelay) runWriter(w *remoteWriter) {
+	aes, _ := pr.connCiphers(w.conn)
 	for {
 		select {
 		case <-w.done:
 			return
 		case <-pr.done:
 			return
-		case frame := <-w.ch:
+		case plaintext := <-w.ch:
+			frame, err := aes.EncryptFrame(plaintext)
+			if err != nil {
+				pr.logger.Warning("REMOTE: Cannot frame packet for %s: %s", w.conn.RemoteAddr(), err)
+				continue
+			}
 			w.conn.SetWriteDeadline(time.Now().Add(remoteWriteTimeout))
-			_, err := w.conn.Write(frame)
+			_, err = w.conn.Write(frame)
 			w.conn.SetWriteDeadline(time.Time{})
 			if err != nil {
+				// net.ErrClosed means we closed it ourselves, which is not a fault.
+				if !errors.Is(err, net.ErrClosed) {
+					pr.logger.Warning("REMOTE: Write error to %s: %s", w.conn.RemoteAddr(), err)
+				}
 				w.conn.Close()
 				return
 			}

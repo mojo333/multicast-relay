@@ -2,11 +2,23 @@ package relay
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"time"
+
+	"github.com/mojo333/multicast-relay/internal/cipher"
 )
+
+// connCiphers returns the ciphers for a connection. Only unencrypted relays have
+// connections without session keys, and for them pr.aes is a passthrough.
+func (pr *PacketRelay) connCiphers(conn net.Conn) (send, recv *cipher.Cipher) {
+	if sc, ok := conn.(*sessionConn); ok {
+		return sc.send, sc.recv
+	}
+	return pr.aes, pr.aes
+}
 
 // startReader launches the per-connection reader goroutine. Reading in a
 // dedicated goroutine keeps blocking reads off the single-threaded event loop:
@@ -25,6 +37,7 @@ func (pr *PacketRelay) runReader(conn net.Conn) {
 	var lastSeq uint64
 	var seqSet bool
 	tmp := make([]byte, 4096)
+	_, aes := pr.connCiphers(conn)
 
 	fail := func() {
 		select {
@@ -63,7 +76,7 @@ func (pr *PacketRelay) runReader(conn net.Conn) {
 				buf = buf[msgLen:]
 				msgLen = -1
 
-				if !pr.deliverRemoteFrame(conn, encrypted, &lastSeq, &seqSet) {
+				if !pr.deliverRemoteFrame(conn, aes, encrypted, &lastSeq, &seqSet) {
 					fail()
 					return
 				}
@@ -74,6 +87,10 @@ func (pr *PacketRelay) runReader(conn net.Conn) {
 			}
 		}
 		if err != nil {
+			// net.ErrClosed means we closed it ourselves, which is not a fault.
+			if !errors.Is(err, net.ErrClosed) {
+				pr.logger.Warning("REMOTE: Read error from %s: %s", conn.RemoteAddr(), err)
+			}
 			fail()
 			return
 		}
@@ -84,8 +101,8 @@ func (pr *PacketRelay) runReader(conn net.Conn) {
 // the decoded packet to the main loop. It returns false only on a fatal error
 // that should close the connection (decrypt failure); malformed-but-nonfatal
 // frames are logged and skipped (returning true).
-func (pr *PacketRelay) deliverRemoteFrame(conn net.Conn, encrypted []byte, lastSeq *uint64, seqSet *bool) bool {
-	decrypted, err := pr.aes.Decrypt(encrypted)
+func (pr *PacketRelay) deliverRemoteFrame(conn net.Conn, aes *cipher.Cipher, encrypted []byte, lastSeq *uint64, seqSet *bool) bool {
+	decrypted, err := aes.Decrypt(encrypted)
 	if err != nil {
 		pr.logger.Warning("REMOTE: Decrypt error from %s — closing", conn.RemoteAddr())
 		return false
@@ -225,6 +242,14 @@ func (pr *PacketRelay) dialRemote(ra *RemoteAddr) {
 			return
 		}
 		conn.SetDeadline(time.Time{})
+
+		toServer, toClient, err := pr.aes.Session(serverChallenge, clientChallenge)
+		if err != nil {
+			conn.Close()
+			pr.sendConnectResult(connectResult{ra: ra, err: err})
+			return
+		}
+		conn = &sessionConn{Conn: conn, send: toServer, recv: toClient}
 	}
 
 	pr.sendConnectResult(connectResult{ra: ra, conn: conn})
@@ -334,6 +359,14 @@ func (pr *PacketRelay) acceptLoop() {
 				continue
 			}
 			conn.SetDeadline(time.Time{})
+
+			toServer, toClient, err := pr.aes.Session(serverChallenge, clientChallenge)
+			if err != nil {
+				pr.logger.Warning("REMOTE: Session key derivation failed: %s", err)
+				conn.Close()
+				continue
+			}
+			conn = &sessionConn{Conn: conn, send: toClient, recv: toServer}
 		}
 
 		pr.acceptCh <- conn

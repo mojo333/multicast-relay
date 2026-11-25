@@ -203,6 +203,11 @@ func resolveInterface(spec string) (*InterfaceResult, error) {
 				Broadcast: netip.AddrFrom4(bcastBytes),
 			}, nil
 		}
+
+		// No usable address yet: return the name so that --wait can retry it.
+		if nameMatch {
+			return &InterfaceResult{Name: iface.Name, MAC: iface.HardwareAddr}, nil
+		}
 	}
 
 	return nil, fmt.Errorf("interface %s not found", spec)
