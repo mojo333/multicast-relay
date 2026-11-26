@@ -1,10 +1,14 @@
 package logger
 
 import (
+	"log/slog"
+	"log/syslog"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNewForegroundVerbose(t *testing.T) {
@@ -374,4 +378,44 @@ func TestCloseFlushesMonitor(t *testing.T) {
 
 	// Double close should not panic
 	l.Close()
+}
+
+func TestSyslogSeverityFollowsLevel(t *testing.T) {
+	// Stands in for the syslog daemon.
+	daemon, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer daemon.Close()
+	sw, err := syslog.Dial("udp", daemon.LocalAddr().String(), syslog.LOG_INFO|syslog.LOG_DAEMON, "multicast-relay")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sw.Close()
+	log := slog.New(newSyslogHandler(sw, slog.LevelInfo))
+
+	// A priority is the daemon facility (3 x 8) plus the severity.
+	for _, c := range []struct {
+		write    func(string, ...any)
+		message  string
+		priority string
+	}{
+		{log.Info, "all is well", "<30>"},
+		{log.Warn, "something is off", "<28>"},
+		{log.Error, "something broke", "<27>"},
+		// Only the record's own level counts, not words in the message.
+		{log.Info, "level=ERROR quoted in a message", "<30>"},
+	} {
+		c.write(c.message)
+		buf := make([]byte, 1024)
+		daemon.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, _, err := daemon.ReadFrom(buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := string(buf[:n])
+		if !strings.HasPrefix(got, c.priority) || !strings.Contains(got, c.message) {
+			t.Errorf("%q: sent %q, want priority %s", c.message, got, c.priority)
+		}
+	}
 }
