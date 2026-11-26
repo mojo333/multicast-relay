@@ -25,6 +25,12 @@ this is used by Sonos during the initial device-discovery phase, initiated
 by pressing either the infinity button or the play+volume up buttons,
 depending on your Sonos speaker.
 
+Packets that the relay's own host sends from a listed interface's address are
+not copied to the other local interfaces, because services such as a router's
+own mDNS queries already go out on each network. They are still sent to remote
+relays. A service on the host that sends on only one network is therefore not
+heard on the others.
+
 Please note that even when your devices have discovered one another, at
 least in the Sonos case, a unicast connection will be established from
 the speakers back to the controlling-telephone. You will need to make sure

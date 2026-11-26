@@ -104,9 +104,9 @@ func hostReceive(args []string) {
 	}
 }
 
-func senderSocket(ifIP string, port int) int {
+func senderSocket(dev, ifIP string, port int) int {
 	fd := udpSocket()
-	check(unix.BindToDevice(fd, "eth0"))
+	check(unix.BindToDevice(fd, dev))
 	check(unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_BROADCAST, 1))
 	check(unix.SetsockoptInet4Addr(fd, unix.SOL_IP, unix.IP_MULTICAST_IF, ip4(ifIP)))
 	check(unix.SetsockoptInt(fd, unix.SOL_IP, unix.IP_MULTICAST_TTL, 4))
@@ -114,11 +114,11 @@ func senderSocket(ifIP string, port int) int {
 	return fd
 }
 
-// hostSend sends one datagram. Arguments: source-ip destination port size tag.
+// hostSend sends one datagram. Arguments: source-ip destination port size tag device.
 func hostSend(args []string) {
 	port, _ := strconv.Atoi(args[2])
 	size, _ := strconv.Atoi(args[3])
-	fd := senderSocket(args[0], 40000)
+	fd := senderSocket(args[5], args[0], 40000)
 	body := []byte(args[4] + strings.Repeat(".", size-len(args[4])))
 	check(unix.Sendto(fd, body, 0, &unix.SockaddrInet4{Port: port, Addr: ip4(args[1])}))
 }
@@ -138,7 +138,7 @@ func hostRespond(ifIP string) {
 
 // hostSearch sends an SSDP search and prints the reply.
 func hostSearch(ifIP string) {
-	fd := senderSocket(ifIP, 40001)
+	fd := senderSocket("eth0", ifIP, 40001)
 	check(unix.Sendto(fd, []byte("M-SEARCH * HTTP/1.1\r\n"), 0, &unix.SockaddrInet4{Port: 1900, Addr: ip4(ssdpGroup)}))
 	setTimeout(fd, 3*time.Second)
 	buf := make([]byte, 2048)
@@ -315,7 +315,12 @@ func (l lab) start(ns, role string, args ...string) func() []string {
 
 func (l lab) send(host, srcIP, dst string, port, size int, tag string) {
 	l.t.Helper()
-	out, err := l.command(host, "send", srcIP, dst, strconv.Itoa(port), strconv.Itoa(size), tag).CombinedOutput()
+	l.sendVia("eth0", host, srcIP, dst, port, size, tag)
+}
+
+func (l lab) sendVia(dev, host, srcIP, dst string, port, size int, tag string) {
+	l.t.Helper()
+	out, err := l.command(host, "send", srcIP, dst, strconv.Itoa(port), strconv.Itoa(size), tag, dev).CombinedOutput()
 	if err != nil {
 		l.t.Fatalf("send from %s: %v: %s", host, err, out)
 	}
@@ -430,6 +435,23 @@ func TestEndToEnd(t *testing.T) {
 			l.want(0, "broadcast towards listen-only", l.delivered(1, bcast1, 6969, 0))
 		})
 	}
+
+	t.Run("does not copy the relay host's own packets between networks", func(t *testing.T) {
+		l := newLab(t)
+		l.relay("relay", base)
+		for _, c := range []struct {
+			dst, group string
+			port       int
+		}{{mdnsGroup, mdnsGroup, 5353}, {bcast0, "0.0.0.0", 6969}} {
+			port := strconv.Itoa(c.port)
+			near := l.start("h0", "receive", c.group, port, "10.77.0.2", "1500")
+			far := l.start("h1", "receive", c.group, port, "10.77.1.2", "1500")
+			// A service on the relay host sends on r0.
+			l.sendVia("r0", "relay", "10.77.0.1", c.dst, c.port, 150, "own"+port)
+			l.want(1, "own network, "+c.dst, near())
+			l.want(0, "other network, "+c.dst, far())
+		}
+	})
 
 	t.Run("list options accept several values", func(t *testing.T) {
 		l := newLab(t)

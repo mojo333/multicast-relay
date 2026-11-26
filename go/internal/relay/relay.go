@@ -339,6 +339,12 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr netip.Addr, receivi
 		}
 	}
 
+	// A service on this host sends on each local network itself, so copying its
+	// packets between them would only repeat them. Remote sites still need them.
+	if receivingInterface != "remote" && pr.isHostAddr(senderAddr) {
+		return
+	}
+
 	// Extract TTL for logging, then apply local TTL override.
 	ttl := data[8]
 	if pr.ttl > 0 {
@@ -536,6 +542,14 @@ func (pr *PacketRelay) findReceivingIface(senderAddr, origDstAddr netip.Addr) (i
 		}
 	}
 	return "", false
+}
+
+// isHostAddr reports whether addr is this host's own address on a listed
+// interface.
+// shortcut: knows one address per interface, so packets sent from a secondary
+// address are still copied. Read every address if a host needs that.
+func (pr *PacketRelay) isHostAddr(addr netip.Addr) bool {
+	return slices.ContainsFunc(pr.listed, func(l listedInterface) bool { return l.info.Addr == addr })
 }
 
 // isBroadcastOn reports whether addr is the named interface's broadcast address.
