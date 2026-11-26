@@ -346,7 +346,7 @@ func TestGetPutBuffer(t *testing.T) {
 	}
 	putBuffer(bp)
 
-	// Get another buffer — should reuse from pool
+	// Get another buffer, which should come from the pool
 	bp2 := getBuffer(50)
 	b2 := *bp2
 	if len(b2) != 50 {
@@ -447,7 +447,7 @@ func TestIsRemoteBroadcast(t *testing.T) {
 		},
 	}
 
-	// A broadcast from another site on the broadcast relay port is recognized.
+	// A broadcast from another site on the broadcast relay port is recognised.
 	if !pr.isRemoteBroadcast(netip.MustParseAddr("192.168.1.255"), 6969) {
 		t.Error("expected remote broadcast on port 6969 to be recognized")
 	}

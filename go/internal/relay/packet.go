@@ -64,7 +64,7 @@ func ComputeIPChecksum(data []byte, ipHeaderLength int) []byte {
 }
 
 // udpChecksumValue computes the UDP checksum value over the pseudo-header, UDP
-// header, and data without concatenation. Per RFC 768, a computed checksum of
+// header and data without concatenation. Per RFC 768, a computed checksum of
 // zero is transmitted as all-ones (0xFFFF), since an on-wire 0x0000 signals
 // "checksum not computed."
 func udpChecksumValue(ipHeader, udpHeader, data []byte) uint16 {
@@ -100,7 +100,7 @@ func ComputeUDPChecksum(ipHeader, udpHeader, data []byte) []byte {
 // copyIPPayloadRange copies the [start:end) byte range of the virtual
 // concatenation (udpHeader ++ payload) into dst. udpHeader is 8 bytes; bytes at
 // virtual offset < 8 come from udpHeader, the rest from payload. Used to build
-// IP fragments without materializing the full IP payload in a heap buffer.
+// IP fragments without materialising the full IP payload in a heap buffer.
 func copyIPPayloadRange(dst, udpHeader, payload []byte, start, end int) {
 	n := 0
 	if start < len(udpHeader) {
@@ -179,7 +179,7 @@ func ModifyUDPPacket(data []byte, ipHeaderLength int, newSrc netip.Addr, newSrcP
 func MdnsSetUnicastBit(data []byte, ipHeaderLength int) []byte {
 	udpDataStart := ipHeaderLength + 8
 	// Require the full 12-byte DNS header: flags at [2:4], question count at
-	// [4:6], and the label loop below begins at offset 12. A shorter guard
+	// [4:6] and the label loop below begins at offset 12. A shorter guard
 	// (e.g. +4) lets a 4- or 5-byte payload reach the udpData[4:6] read and
 	// panic, which would crash the relay on a crafted mDNS packet.
 	if len(data) < udpDataStart+12 {

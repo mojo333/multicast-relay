@@ -7,14 +7,14 @@ A Go reimplementation of Al Smith's Python multicast-relay. Relays broadcast and
 ```
 go/
   cmd/multicast-relay/main.go       # CLI entry point, flag parsing, signal handling
-  internal/relay/relay.go           # PacketRelay struct, constructor, top-level setup
-  internal/relay/relay_types.go     # Shared relay types (PacketRelay, sessionConn, etc.)
+  internal/relay/relay.go           # Constructor, packet processing, duplicate filter, ifFilter, SSDP, remote write queue
+  internal/relay/relay_types.go     # Shared relay types (PacketRelay, Config, sessionConn, etc.)
   internal/relay/relay_loop.go      # Loop(): unix.Poll()-driven event loop
-  internal/relay/relay_socket.go    # AddListener: receive/transmit socket setup, multicast/broadcast join
-  internal/relay/relay_remote.go    # Remote TCP mesh: framing, read/dispatch of remote connections
+  internal/relay/relay_socket.go    # AddListener: sockets and multicast joins, interface resolution and recovery, transmit
+  internal/relay/relay_remote.go    # Remote TCP mesh: dial, accept, authentication, read/dispatch
   internal/relay/packet.go          # IP/UDP checksums, packet modification, multicast/broadcast helpers
-  internal/relay/arp.go             # ARP table lookup via /proc/net/arp
-  internal/cipher/cipher.go         # AES-256-GCM encryption for remote relay connections
+  internal/relay/arp.go             # ARP table parsing (/proc/net/arp)
+  internal/cipher/cipher.go         # Peer authentication and AES-256-GCM encryption for remote relay connections
   internal/logger/logger.go         # slog-based logging (syslog, stdout, file, monitor)
   go.mod / go.sum
 release.sh                          # Cross-compiles and publishes a GitHub release via gh
@@ -40,7 +40,7 @@ go vet ./...
 # Build for host
 go build ./cmd/multicast-relay/
 
-# Cross-compile (as done in CI and release.sh)
+# Cross-compile (as done in CI; release.sh also sets -X main.version)
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64  go build -ldflags="-s -w" -o ../bin/multicast-relay-amd64 ./cmd/multicast-relay/
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64  go build -ldflags="-s -w" -o ../bin/multicast-relay-arm64 ./cmd/multicast-relay/
 CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -ldflags="-s -w" -o ../bin/multicast-relay-armv7 ./cmd/multicast-relay/
@@ -50,10 +50,11 @@ Releases are published with `./release.sh vX.Y [notes-file]` from a clean checko
 
 ## Key Architecture Notes
 
-- **Raw sockets**: uses `AF_PACKET` sockets for packet capture and transmission (Linux only).
+- **Raw sockets**: receives on `AF_INET` raw UDP sockets and transmits on `AF_PACKET` sockets (Linux only).
 - **Event loop**: single-threaded, driven by `unix.Poll()` in `relay_loop.go:Loop()`. The timeout is 1 s, or 100 ms when a remote relay is configured, because remote packets arrive on a channel rather than the poll fd set and the timeout bounds their latency.
 - **Duplicate suppression**: ring buffer of 256 recent packet fingerprints (IP ID, TTL, addresses, ports and payload), recorded on receipt and on transmit and expiring after 2 s.
 - **Receive sockets**: multicast sockets clear `IP_MULTICAST_ALL` and broadcast sockets are bound to one interface each (subnet and limited broadcast), so unlisted interfaces are not heard.
+- **Host's own packets**: those sent from a listed interface's address go to remote relays but are not copied between local interfaces.
 - **Remote relay**: TCP transport with 2-byte length-prefixed framing and a reader and writer goroutine per connection; optional AES-256-GCM via `--aes`, with mutual authentication and per-connection, per-direction session keys.
 - **Interface recovery**: the loop checks listed interfaces every 2 s and reopens all sockets when one is recreated or readdressed. After `--drop-user` it exits instead.
 - **Buffer reuse**: `sync.Pool` for packet buffers.
@@ -61,7 +62,7 @@ Releases are published with `./release.sh vX.Y [notes-file]` from a clean checko
 
 ## Target Platforms
 
-Linux only (uses `AF_PACKET`, `/proc/net/arp`, syslog). Primary deployment target is Unifi Dream Machine Pro (arm64).
+Linux only (uses `AF_PACKET`, `/proc/net/arp`, syslog). Primary deployment target is UniFi Dream Machine Pro (arm64).
 
 ## Default Relayed Traffic
 
@@ -69,4 +70,4 @@ Linux only (uses `AF_PACKET`, `/proc/net/arp`, syslog). Primary deployment targe
 |----------|---------|------|
 | mDNS | 224.0.0.251 | 5353 |
 | SSDP | 239.255.255.250 | 1900 |
-| Sonos discovery (broadcast) | — | 6969 |
+| Sonos discovery (broadcast) | 255.255.255.255 and subnet broadcast | 6969 |

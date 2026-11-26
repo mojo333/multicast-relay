@@ -290,10 +290,9 @@ func (r *InterfaceResult) equal(o *InterfaceResult) bool {
 }
 
 // resolveInterface does a single pass over all system interfaces to find one
-// matching by name, IPv4 address, or CIDR block. This replaces the old
-// netifaces package which required up to 3 separate full enumerations.
+// matching by name, IPv4 address or CIDR block.
 func resolveInterface(spec string) (*InterfaceResult, error) {
-	// Determine if spec is a CIDR prefix, an IP address, or a name.
+	// Determine if spec is a CIDR prefix, an IP address or a name.
 	specPrefix, cidrErr := netip.ParsePrefix(spec)
 	specAddr, addrErr := netip.ParseAddr(spec)
 	isCIDR := cidrErr == nil
@@ -413,7 +412,7 @@ func (pr *PacketRelay) resolveInterfaceWait(iface string, wait bool) (*Interface
 // transmitPacket builds ethernet frames and sends a packet via a transmitter socket.
 // Uses a pooled scratch buffer to avoid per-fragment heap allocations.
 // Implements proper IP fragmentation per RFC 791: fragment offsets in 8-byte units,
-// only the first fragment includes the transport header, and boundaries are 8-byte aligned.
+// only the first fragment includes the transport header and boundaries are 8-byte aligned.
 func (pr *PacketRelay) transmitPacket(tx *Transmitter, destMac net.HardwareAddr, ipHeaderLength int, data []byte) error {
 	ipHeader := data[:ipHeaderLength]
 	udpHeader := data[ipHeaderLength : ipHeaderLength+8]
@@ -430,7 +429,7 @@ func (pr *PacketRelay) transmitPacket(tx *Transmitter, destMac net.HardwareAddr,
 	hasEther := !bytes.Equal(tx.MAC, zeroMAC)
 
 	// Remember the packet as sent (post TTL, masquerade and SSDP rewrite) so the
-	// relay recognizes it if it loops back on a listening interface.
+	// relay recognises it if it loops back on a listening interface.
 	pr.remember(dedupKey(data, ipHeaderLength))
 
 	ipPayloadLen := 8 + len(payload)

@@ -49,7 +49,7 @@ const (
 )
 
 const (
-	// maxPacketSize is the maximum expected packet size for pooled buffers.
+	// maxPacketSize is the largest IP packet the relay accepts.
 	maxPacketSize = 10240
 
 	// maxFrameBufferSize is the largest transmit scratch buffer: a full-size IP
@@ -110,7 +110,7 @@ func putBuffer(bp *[]byte) {
 	packetPool.Put(bp)
 }
 
-// New creates and initializes a new PacketRelay.
+// New creates and initialises a new PacketRelay.
 func New(cfg Config) (*PacketRelay, error) {
 	noTx := make(map[string]bool, len(cfg.NoTransmitInterfaces))
 	for _, nt := range cfg.NoTransmitInterfaces {
@@ -253,7 +253,7 @@ func (pr *PacketRelay) cleanUp() {
 
 // processPacket processes an incoming packet and relays it to other interfaces.
 // receivingInterface is a local interface name, "local" when the sender's address
-// has to identify it, or "remote" with from set to the connection it arrived on.
+// has to identify it or "remote" with from set to the connection it arrived on.
 func (pr *PacketRelay) processPacket(data []byte, senderAddr netip.Addr, receivingInterface string, from net.Conn) {
 	if len(data) < minUDPPacketLen {
 		return
@@ -290,7 +290,7 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr netip.Addr, receivi
 	case "remote":
 		// A broadcast packet arriving over the remote relay carries the sending
 		// site's subnet broadcast as its destination, which never equals any
-		// local interface's broadcast. Recognize it here so it can be re-broadcast
+		// local interface's broadcast. Recognise it here so it can be re-broadcast
 		// onto local interfaces instead of being silently dropped.
 		broadcastPacket = pr.isRemoteBroadcast(origDstAddr, origDstPort)
 	default:
@@ -339,8 +339,8 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr netip.Addr, receivi
 		}
 	}
 
-	// A service on this host sends on each local network itself, so copying its
-	// packets between them would only repeat them. Remote sites still need them.
+	// Services on this host choose which local networks to send on, so their
+	// packets are not copied between them. Remote sites still need them.
 	if receivingInterface != "remote" && pr.isHostAddr(senderAddr) {
 		return
 	}
@@ -467,7 +467,7 @@ func (pr *PacketRelay) applyMDNS(data []byte, ipHeaderLength int, dstAddr netip.
 }
 
 // handleSSDP processes SSDP M-SEARCH interception and unicast reply routing.
-// It may modify srcAddr/srcPort (M-SEARCH), dstAddr/dstPort (unicast reply), data, and destMac.
+// It may modify srcAddr/srcPort (M-SEARCH), dstAddr/dstPort (unicast reply), data and destMac.
 // Returns drop=true when the packet should be silently discarded.
 func (pr *PacketRelay) handleSSDP(data []byte, ipHeaderLength int, srcAddr netip.Addr, srcPort uint16, dstAddr netip.Addr, dstPort uint16) (outData []byte, outSrcAddr netip.Addr, outSrcPort uint16, outDstAddr netip.Addr, outDstPort uint16, destMac net.HardwareAddr, drop bool) {
 	outData, outSrcAddr, outSrcPort, outDstAddr, outDstPort = data, srcAddr, srcPort, dstAddr, dstPort
@@ -669,7 +669,7 @@ func dedupKey(packet []byte, ipHeaderLength int) uint64 {
 }
 
 // isDuplicate checks whether this packet was seen within dedupWindow.
-// Not safe for concurrent use — only call from the main loop goroutine.
+// Not safe for concurrent use, so only call it from the main loop goroutine.
 func (pr *PacketRelay) isDuplicate(key uint64) bool {
 	now := time.Now()
 	for i := range pr.recent {
@@ -681,7 +681,7 @@ func (pr *PacketRelay) isDuplicate(key uint64) bool {
 }
 
 // remember records a packet in the ring buffer.
-// Not safe for concurrent use — only call from the main loop goroutine.
+// Not safe for concurrent use, so only call it from the main loop goroutine.
 func (pr *PacketRelay) remember(key uint64) {
 	pr.recent[pr.recentIdx] = seenPacket{key: key, at: time.Now()}
 	pr.recentIdx = (pr.recentIdx + 1) % maxRecentPackets
