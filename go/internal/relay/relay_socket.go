@@ -3,13 +3,19 @@ package relay
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+// ifaceCheckInterval is how often the loop looks for recreated or readdressed
+// interfaces.
+const ifaceCheckInterval = 2 * time.Second
 
 // AddListener sets up receive and transmit sockets for a relay address.
 func (pr *PacketRelay) AddListener(addr string, port int, service string) error {
@@ -17,105 +23,231 @@ func (pr *PacketRelay) AddListener(addr string, port int, service string) error 
 	if err != nil {
 		return fmt.Errorf("invalid relay address %q: %w", addr, err)
 	}
-	if IsBroadcast(addr) {
-		pr.etherAddrs[addrN] = BroadcastIPToMAC()
-	} else if IsMulticast(addr) {
-		pr.etherAddrs[addrN] = MulticastIPToMAC(addr)
-	} else {
-		pr.etherAddrs[addrN] = nil
+	rule := relayRule{addr: addrN, port: port, service: service}
+	if err := pr.openRule(rule, pr.wait); err != nil {
+		return err
+	}
+	pr.relays = append(pr.relays, rule)
+	return nil
+}
+
+// openRule opens the sockets for one relay rule on every listed interface. When
+// wait is true it blocks until each interface has an IPv4 address.
+func (pr *PacketRelay) openRule(rule relayRule, wait bool) (err error) {
+	addr := rule.addr.String()
+	isBroadcast, isMulticast := IsBroadcast(addr), IsMulticast(addr)
+	switch {
+	case isBroadcast:
+		pr.etherAddrs[rule.addr] = BroadcastIPToMAC()
+	case isMulticast:
+		pr.etherAddrs[rule.addr] = MulticastIPToMAC(addr)
+	default:
+		pr.etherAddrs[rule.addr] = nil
 	}
 
-	var multicastRxFd int = -1
-
-	if IsMulticast(addr) {
-		fd, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_UDP)
-		if err != nil {
-			return fmt.Errorf("cannot create multicast receive socket: %w", err)
+	// Multicast and unicast rules use one receive socket for all interfaces.
+	shared := -1
+	if !isBroadcast {
+		if shared, err = newReceiveSocket(); err != nil {
+			return err
 		}
-		if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
-			unix.Close(fd)
-			return fmt.Errorf("cannot set SO_REUSEADDR: %w", err)
+		defer func() {
+			if err != nil {
+				unix.Close(shared)
+			}
+		}()
+	}
+	if isMulticast {
+		// Without this the socket also receives the group from any interface on
+		// which some other program joined it, listed or not.
+		if err = unix.SetsockoptInt(shared, unix.SOL_IP, unix.IP_MULTICAST_ALL, 0); err != nil {
+			return fmt.Errorf("cannot clear IP_MULTICAST_ALL: %w", err)
 		}
-		multicastRxFd = fd
 	}
 
-	for _, iface := range pr.interfaces {
-		ifInfo, err := pr.getInterface(iface)
+	for _, spec := range pr.interfaces {
+		ifInfo, err := pr.resolveInterfaceWait(spec, wait)
 		if err != nil {
 			return err
 		}
+		pr.listInterface(spec, ifInfo)
 
-		if IsBroadcast(addr) {
-			fd, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_UDP)
-			if err != nil {
-				return fmt.Errorf("cannot create broadcast receive socket: %w", err)
+		if isBroadcast {
+			// Devices use either the subnet's broadcast address or the limited one.
+			for _, bindAddr := range []netip.Addr{ifInfo.Broadcast, broadcastIP} {
+				rx, err := openBroadcastReceiver(ifInfo.Name, bindAddr, rule.port)
+				if err != nil {
+					return err
+				}
+				if bindAddr == broadcastIP {
+					rx.readdressAs = ifInfo.Broadcast
+				}
+				pr.receivers = append(pr.receivers, rx)
 			}
-			if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
-				unix.Close(fd)
-				return fmt.Errorf("cannot set SO_REUSEADDR: %w", err)
-			}
-			if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_BROADCAST, 1); err != nil {
-				unix.Close(fd)
-				return fmt.Errorf("cannot set SO_BROADCAST: %w", err)
-			}
-
-			bcastBytes := ifInfo.Broadcast.As4()
-			sa := &unix.SockaddrInet4{Port: port, Addr: bcastBytes}
-			if err := unix.Bind(fd, sa); err != nil {
-				unix.Close(fd)
-				return fmt.Errorf("cannot bind broadcast socket to %s:%d: %w", ifInfo.Broadcast, port, err)
-			}
-			pr.receivers = append(pr.receivers, Receiver{fd: fd})
-
-		} else if IsMulticast(addr) {
-			mcastIP := net.ParseIP(addr).To4()
-			ifIPBytes := ifInfo.Addr.As4()
-			mreq := &unix.IPMreq{}
-			copy(mreq.Multiaddr[:], mcastIP)
-			copy(mreq.Interface[:], ifIPBytes[:])
-			if err := unix.SetsockoptIPMreq(multicastRxFd, unix.SOL_IP, unix.IP_ADD_MEMBERSHIP, mreq); err != nil {
+		} else if isMulticast {
+			mreq := &unix.IPMreq{Multiaddr: rule.addr.As4(), Interface: ifInfo.Addr.As4()}
+			if err := unix.SetsockoptIPMreq(shared, unix.SOL_IP, unix.IP_ADD_MEMBERSHIP, mreq); err != nil {
 				return fmt.Errorf("cannot join multicast group %s on %s: %w", addr, ifInfo.Name, err)
 			}
 		}
 
 		// Create transmitter for this interface (unless in noTransmitInterfaces)
-		if !pr.noTransmitInterfaces[iface] {
-			txFd, err := createTransmitSocket(ifInfo.Name)
+		if !pr.noTransmitInterfaces[ifInfo.Name] {
+			txFd, err := createTransmitSocket(ifInfo)
 			if err != nil {
 				return err
 			}
 
-			listenNetip := addrN
-			if IsBroadcast(addr) {
+			listenNetip := rule.addr
+			if isBroadcast {
 				listenNetip = ifInfo.Broadcast
 			}
 
 			pr.transmitters = append(pr.transmitters, Transmitter{
-				Relay:     RelayAddr{Addr: listenNetip, Port: port},
+				Relay:     RelayAddr{Addr: listenNetip, Port: rule.port},
 				Interface: ifInfo.Name,
 				Addr:      ifInfo.Addr,
 				MAC:       ifInfo.MAC,
 				Network:   ifInfo.Network,
 				Broadcast: ifInfo.Broadcast,
 				Socket:    txFd,
-				Service:   service,
+				Service:   rule.service,
 			})
 		}
 	}
 
-	if IsMulticast(addr) {
-		mcastIP := net.ParseIP(addr).To4()
-		sa := &unix.SockaddrInet4{Port: port}
-		copy(sa.Addr[:], mcastIP)
-		if err := unix.Bind(multicastRxFd, sa); err != nil {
-			unix.Close(multicastRxFd)
-			return fmt.Errorf("cannot bind multicast socket to %s:%d: %w", addr, port, err)
+	if shared >= 0 {
+		sa := &unix.SockaddrInet4{Port: rule.port, Addr: rule.addr.As4()}
+		if err = unix.Bind(shared, sa); err != nil {
+			return fmt.Errorf("cannot bind receive socket to %s:%d: %w", addr, rule.port, err)
 		}
-		pr.receivers = append(pr.receivers, Receiver{fd: multicastRxFd})
+		pr.receivers = append(pr.receivers, Receiver{fd: shared, port: rule.port})
 	}
 
 	pr.pollDirty = true
 	return nil
+}
+
+// newReceiveSocket creates a raw UDP socket that can share its address.
+func newReceiveSocket() (int, error) {
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_UDP)
+	if err != nil {
+		return -1, fmt.Errorf("cannot create receive socket: %w", err)
+	}
+	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
+		unix.Close(fd)
+		return -1, fmt.Errorf("cannot set SO_REUSEADDR: %w", err)
+	}
+	return fd, nil
+}
+
+// openBroadcastReceiver receives one broadcast address on one interface only.
+func openBroadcastReceiver(ifName string, addr netip.Addr, port int) (rx Receiver, err error) {
+	fd, err := newReceiveSocket()
+	if err != nil {
+		return rx, err
+	}
+	defer func() {
+		if err != nil {
+			unix.Close(fd)
+		}
+	}()
+	if err = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_BROADCAST, 1); err != nil {
+		return rx, fmt.Errorf("cannot set SO_BROADCAST: %w", err)
+	}
+	if err = unix.BindToDevice(fd, ifName); err != nil {
+		return rx, fmt.Errorf("cannot bind broadcast socket to %s: %w", ifName, err)
+	}
+	if err = unix.Bind(fd, &unix.SockaddrInet4{Port: port, Addr: addr.As4()}); err != nil {
+		return rx, fmt.Errorf("cannot bind broadcast socket to %s:%d: %w", addr, port, err)
+	}
+	return Receiver{fd: fd, port: port, iface: ifName}, nil
+}
+
+// listInterface records a listed interface, and extends the listen-only and
+// masquerade sets to its real name when they refer to it in another way.
+func (pr *PacketRelay) listInterface(spec string, info *InterfaceResult) {
+	if slices.ContainsFunc(pr.listed, func(l listedInterface) bool { return l.spec == spec }) {
+		return
+	}
+	pr.listed = append(pr.listed, listedInterface{spec: spec, info: *info})
+	for _, set := range []map[string]bool{pr.noTransmitInterfaces, pr.masquerade} {
+		if selects(set, spec, info.Name) {
+			set[info.Name] = true
+		}
+	}
+}
+
+// selects reports whether a set of interface specs (names, addresses or CIDR
+// blocks) refers to the interface called name and listed as spec.
+func selects(set map[string]bool, spec, name string) bool {
+	if set[spec] || set[name] {
+		return true
+	}
+	for other := range set {
+		if r, err := resolveInterface(other); err == nil && r.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// reopenChangedInterfaces reopens every socket once a listed interface has been
+// recreated or readdressed. It returns an error only when the relay can no longer
+// open sockets and has to be restarted.
+//
+// shortcut: waits until every listed interface is usable, reopen them one by one
+// if a permanently missing interface must not hold the others back.
+func (pr *PacketRelay) reopenChangedInterfaces() error {
+	changed, usable := false, true
+	for i := range pr.listed {
+		l := &pr.listed[i]
+		current, err := pr.resolveInterfaceWait(l.spec, false)
+		if err != nil {
+			if !l.missing {
+				pr.logger.Warning("Interface %s is unavailable: %s", l.spec, err)
+				l.missing = true
+			}
+			usable = false
+			continue
+		}
+		l.missing = false
+		changed = changed || !current.equal(&l.info)
+	}
+	if !changed || !usable {
+		return nil
+	}
+
+	listed, receivers, transmitters := pr.listed, pr.receivers, pr.transmitters
+	pr.listed, pr.receivers, pr.transmitters = nil, nil, nil
+	for _, rule := range pr.relays {
+		if err := pr.openRule(rule, false); err != nil {
+			closeSockets(pr.receivers, pr.transmitters)
+			pr.listed, pr.receivers, pr.transmitters = listed, receivers, transmitters
+			if errors.Is(err, unix.EPERM) {
+				return fmt.Errorf("interfaces changed and privileges have been dropped, restart the relay: %w", err)
+			}
+			if !pr.reopenFailed {
+				pr.logger.Warning("Interfaces changed but sockets cannot be reopened yet: %s", err)
+				pr.reopenFailed = true
+			}
+			return nil
+		}
+	}
+	closeSockets(receivers, transmitters)
+	pr.reopenFailed = false
+	pr.logger.Warning("Interfaces changed, sockets reopened")
+	return nil
+}
+
+// closeSockets closes receive and transmit sockets.
+func closeSockets(receivers []Receiver, transmitters []Transmitter) {
+	for _, rx := range receivers {
+		unix.Close(rx.fd)
+	}
+	for _, tx := range transmitters {
+		unix.Close(tx.Socket)
+	}
 }
 
 // rebuildPollFds rebuilds the pre-allocated poll fd set.
@@ -132,10 +264,17 @@ func (pr *PacketRelay) rebuildPollFds() {
 // InterfaceResult holds resolved interface information.
 type InterfaceResult struct {
 	Name      string
+	Index     int
 	MAC       net.HardwareAddr
 	Addr      netip.Addr
 	Network   netip.Prefix
 	Broadcast netip.Addr
+}
+
+// equal reports whether two results describe the same interface and addresses.
+func (r *InterfaceResult) equal(o *InterfaceResult) bool {
+	return r.Name == o.Name && r.Index == o.Index && r.Addr == o.Addr && r.Network == o.Network &&
+		r.Broadcast == o.Broadcast && bytes.Equal(r.MAC, o.MAC)
 }
 
 // resolveInterface does a single pass over all system interfaces to find one
@@ -197,6 +336,7 @@ func resolveInterface(spec string) (*InterfaceResult, error) {
 
 			return &InterfaceResult{
 				Name:      iface.Name,
+				Index:     iface.Index,
 				MAC:       iface.HardwareAddr,
 				Addr:      ifAddr,
 				Network:   netip.PrefixFrom(ifAddr, ones).Masked(),
@@ -206,24 +346,17 @@ func resolveInterface(spec string) (*InterfaceResult, error) {
 
 		// No usable address yet: return the name so that --wait can retry it.
 		if nameMatch {
-			return &InterfaceResult{Name: iface.Name, MAC: iface.HardwareAddr}, nil
+			return &InterfaceResult{Name: iface.Name, Index: iface.Index, MAC: iface.HardwareAddr}, nil
 		}
 	}
 
 	return nil, fmt.Errorf("interface %s not found", spec)
 }
 
-// getInterface resolves an interface spec, waiting for an IPv4 address if the
-// --wait option is configured. This may block and is only safe to call during
-// startup, before the event loop runs.
-func (pr *PacketRelay) getInterface(iface string) (*InterfaceResult, error) {
-	return pr.resolveInterfaceWait(iface, pr.wait)
-}
-
 // resolveInterfaceWait resolves an interface spec. When wait is true it blocks
 // (checking pr.done) until the interface has an IPv4 address. Callers on the
-// event-loop goroutine (e.g. transmitter recovery) must pass wait=false so a
-// missing address cannot stall the entire relay.
+// event-loop goroutine must pass wait=false so a missing address cannot stall
+// the entire relay.
 func (pr *PacketRelay) resolveInterfaceWait(iface string, wait bool) (*InterfaceResult, error) {
 	result, err := resolveInterface(iface)
 	if err != nil {
@@ -265,31 +398,6 @@ func (pr *PacketRelay) resolveInterfaceWait(iface string, wait bool) (*Interface
 	return result, nil
 }
 
-// recoverTransmitter attempts to re-create the transmit socket after ENXIO.
-func (pr *PacketRelay) recoverTransmitter(tx *Transmitter, destMac net.HardwareAddr, ipHeaderLength int, data []byte) {
-	pr.logger.Info("Attempting to recover interface %s", tx.Interface)
-	// Never wait here: recovery runs on the event-loop goroutine, so blocking
-	// on a missing IPv4 address would stall all relaying and clean shutdown.
-	ifInfo, err := pr.resolveInterfaceWait(tx.Interface, false)
-	if err != nil {
-		pr.logger.Warning("Recovery failed for %s: %s", tx.Interface, err)
-		return
-	}
-	newFd, err := createTransmitSocket(ifInfo.Name)
-	if err != nil {
-		pr.logger.Warning("Recovery socket creation failed for %s: %s", tx.Interface, err)
-		return
-	}
-	unix.Close(tx.Socket)
-	tx.Socket = newFd
-	tx.MAC = ifInfo.MAC
-	tx.Network = ifInfo.Network
-	tx.Addr = ifInfo.Addr
-	if err := pr.transmitPacket(tx, destMac, ipHeaderLength, data); err != nil {
-		pr.logger.Warning("Recovery retransmit failed for %s: %s", tx.Interface, err)
-	}
-}
-
 // transmitPacket builds ethernet frames and sends a packet via a transmitter socket.
 // Uses a pooled scratch buffer to avoid per-fragment heap allocations.
 // Implements proper IP fragmentation per RFC 791: fragment offsets in 8-byte units,
@@ -308,6 +416,10 @@ func (pr *PacketRelay) transmitPacket(tx *Transmitter, destMac net.HardwareAddr,
 	binary.BigEndian.PutUint16(newUDPHeader[6:8], udpChecksumValue(ipHeader, udpHeader, payload))
 
 	hasEther := !bytes.Equal(tx.MAC, zeroMAC)
+
+	// Remember the packet as sent (post TTL, masquerade and SSDP rewrite) so the
+	// relay recognizes it if it loops back on a listening interface.
+	pr.remember(dedupKey(data, ipHeaderLength))
 
 	ipPayloadLen := 8 + len(payload)
 
@@ -355,12 +467,6 @@ func (pr *PacketRelay) transmitPacket(tx *Transmitter, destMac net.HardwareAddr,
 		ipPacket := scratch[etherOff : etherOff+totalLength]
 		ComputeIPChecksum(ipPacket, ipHeaderLength)
 
-		// Record the transmitted IP checksum so the relay recognizes this packet
-		// when it loops back on its own listening interface. The dedup ring must
-		// hold the checksum that actually goes on the wire (post TTL/masquerade/
-		// SSDP rewrite), not the pre-modification checksum of the received packet.
-		pr.addChecksum(binary.BigEndian.Uint16(ipPacket[10:12]))
-
 		var frame []byte
 		if hasEther {
 			// Prepend ethernet header: destMac + srcMac + etherType
@@ -380,37 +486,23 @@ func (pr *PacketRelay) transmitPacket(tx *Transmitter, destMac net.HardwareAddr,
 	return nil
 }
 
-// interfaceIndex returns the OS interface index for a named interface.
-func interfaceIndex(name string) (int, error) {
-	iface, err := net.InterfaceByName(name)
-	if err != nil {
-		return 0, err
-	}
-	return iface.Index, nil
-}
-
 // createTransmitSocket creates and binds a send-only AF_PACKET raw socket for the
 // named interface. The socket protocol is 0 (rather than ETH_P_ALL): these sockets
 // are only ever written to, never read or polled, so binding them to ETH_P_ALL
 // would needlessly install a kernel receive tap that clones every packet in and
 // out of the interface into a queue that is never drained.
-func createTransmitSocket(ifName string) (int, error) {
+func createTransmitSocket(iface *InterfaceResult) (int, error) {
 	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, 0)
 	if err != nil {
-		return 0, fmt.Errorf("cannot create transmit socket for %s: %w", ifName, err)
-	}
-	ifIndex, err := interfaceIndex(ifName)
-	if err != nil {
-		unix.Close(fd)
-		return 0, fmt.Errorf("cannot get interface index for %s: %w", ifName, err)
+		return 0, fmt.Errorf("cannot create transmit socket for %s: %w", iface.Name, err)
 	}
 	sa := &unix.SockaddrLinklayer{
 		Protocol: 0,
-		Ifindex:  ifIndex,
+		Ifindex:  iface.Index,
 	}
 	if err := unix.Bind(fd, sa); err != nil {
 		unix.Close(fd)
-		return 0, fmt.Errorf("cannot bind transmit socket to %s: %w", ifName, err)
+		return 0, fmt.Errorf("cannot bind transmit socket to %s: %w", iface.Name, err)
 	}
 	return fd, nil
 }

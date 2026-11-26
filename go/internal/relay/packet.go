@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"net"
 	"net/netip"
+	"os"
 )
 
 // Pre-parsed multicast range boundaries for fast comparison.
@@ -255,39 +256,6 @@ func BroadcastIPToMAC() net.HardwareAddr {
 	return net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
 }
 
-// IP2Long converts a dotted-quad IP string to a uint32.
-func IP2Long(ip string) uint32 {
-	addr, err := netip.ParseAddr(ip)
-	if err != nil || !addr.Is4() {
-		return 0
-	}
-	b := addr.As4()
-	return binary.BigEndian.Uint32(b[:])
-}
-
-// Long2IP converts a uint32 to a dotted-quad IP string.
-func Long2IP(ip uint32) string {
-	var b [4]byte
-	binary.BigEndian.PutUint32(b[:], ip)
-	return netip.AddrFrom4(b).String()
-}
-
-// OnNetwork checks if an IP address is within a network prefix.
-func OnNetwork(ip netip.Addr, network netip.Prefix) bool {
-	return network.Contains(ip)
-}
-
-// OnNetworkPrefix checks if an IP address is within a netip.Prefix.
-func OnNetworkPrefix(ip netip.Addr, prefix netip.Prefix) bool {
-	return prefix.Contains(ip)
-}
-
-// CIDRToNetmask converts CIDR prefix bits to a dotted-quad netmask string.
-func CIDRToNetmask(bits int) string {
-	mask := uint32(0xffffffff) << (32 - bits) & 0xffffffff
-	return Long2IP(mask)
-}
-
 // AddrFrom4Bytes creates a netip.Addr from 4 raw bytes (no heap allocation).
 func AddrFrom4Bytes(b []byte) netip.Addr {
 	return netip.AddrFrom4([4]byte{b[0], b[1], b[2], b[3]})
@@ -297,7 +265,7 @@ func AddrFrom4Bytes(b []byte) netip.Addr {
 // If procNetArp is non-empty, it is used instead of reading /proc/net/arp.
 func UnicastIPToMAC(ip string, procNetArp string) (string, error) {
 	if procNetArp == "" {
-		data, err := readFile("/proc/net/arp")
+		data, err := os.ReadFile("/proc/net/arp")
 		if err != nil {
 			return "", err
 		}

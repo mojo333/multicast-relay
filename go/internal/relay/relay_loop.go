@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"encoding/binary"
 	"fmt"
 	"time"
 
@@ -8,8 +9,11 @@ import (
 )
 
 // Loop runs the main packet relay event loop.
+// It closes the relay's sockets and connections when it returns.
 func (pr *PacketRelay) Loop() error {
+	defer pr.cleanUp()
 	buf := make([]byte, maxPacketSize)
+	nextIfaceCheck := time.Now().Add(ifaceCheckInterval)
 
 	// When remote relay is active, remote TCP connections are serviced once per
 	// loop iteration, so a shorter poll timeout bounds remote packet latency when
@@ -24,6 +28,13 @@ func (pr *PacketRelay) Loop() error {
 		case <-pr.done:
 			return nil
 		default:
+		}
+
+		if !time.Now().Before(nextIfaceCheck) {
+			if err := pr.reopenChangedInterfaces(); err != nil {
+				return err
+			}
+			nextIfaceCheck = time.Now().Add(ifaceCheckInterval)
 		}
 
 		if pr.hasUnconnectedRemotes() {
@@ -96,10 +107,12 @@ func (pr *PacketRelay) Loop() error {
 			continue
 		}
 
-		for _, pfd := range pr.pollFds {
+		for i, pfd := range pr.pollFds { // pollFds[i] belongs to receivers[i]
 			if pfd.Revents&unix.POLLIN == 0 {
 				continue
 			}
+
+			rx := pr.receivers[i]
 
 			// Local receiver. processPacket runs synchronously and copies whatever
 			// it needs to retain, so buf can be passed directly without a defensive
@@ -109,7 +122,7 @@ func (pr *PacketRelay) Loop() error {
 				pr.logger.Warning("Error receiving packet: %s", err)
 				continue
 			}
-			if nread == 0 {
+			if nread < minUDPPacketLen {
 				continue
 			}
 
@@ -118,7 +131,27 @@ func (pr *PacketRelay) Loop() error {
 				continue
 			}
 			senderAddr := AddrFrom4Bytes(sa.Addr[:])
-			pr.processPacket(buf[:nread], senderAddr, "local")
+			packet := buf[:nread]
+			ipHeaderLength := int(packet[0]&0x0f) * 4
+			if ipHeaderLength+4 > nread || int(binary.BigEndian.Uint16(packet[ipHeaderLength+2:])) != rx.port {
+				continue
+			}
+			if total := int(binary.BigEndian.Uint16(packet[2:4])); total > nread {
+				pr.logger.Warning("Dropping truncated datagram from %s: %d bytes, at most %d are supported", senderAddr, total, len(buf))
+				continue
+			}
+			if rx.readdressAs.IsValid() {
+				addr := rx.readdressAs.As4()
+				copy(packet[16:20], addr[:])
+				ComputeIPChecksum(packet, ipHeaderLength)
+			}
+			// With one interface on two networks the sender's address has to say
+			// which side the packet came from.
+			arrival := rx.iface
+			if arrival == "" || pr.oneInterface {
+				arrival = "local"
+			}
+			pr.processPacket(packet, senderAddr, arrival, nil)
 		}
 	}
 }

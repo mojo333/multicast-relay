@@ -22,7 +22,7 @@ func TestIsDuplicate(t *testing.T) {
 		t.Error("expected 0x1234 to not be duplicate in empty ring")
 	}
 
-	pr.addChecksum(0x1234)
+	pr.remember(0x1234)
 
 	if !pr.isDuplicate(0x1234) {
 		t.Error("expected 0x1234 to be duplicate after adding")
@@ -37,9 +37,9 @@ func TestIsDuplicate(t *testing.T) {
 func TestAddChecksumMultiple(t *testing.T) {
 	pr := &PacketRelay{}
 
-	pr.addChecksum(0x0001)
-	pr.addChecksum(0x0002)
-	pr.addChecksum(0x0003)
+	pr.remember(0x0001)
+	pr.remember(0x0002)
+	pr.remember(0x0003)
 
 	if !pr.isDuplicate(0x0001) {
 		t.Error("expected 0x0001 to be duplicate")
@@ -59,19 +59,19 @@ func TestDuplicateRingBufferWrap(t *testing.T) {
 	pr := &PacketRelay{}
 
 	// Fill the ring buffer completely with values 0..255
-	for i := 0; i < maxRecentChecksums; i++ {
-		pr.addChecksum(uint16(i))
+	for i := 0; i < maxRecentPackets; i++ {
+		pr.remember(uint64(i))
 	}
 
 	// All values 0..255 should be present
-	for i := 0; i < maxRecentChecksums; i++ {
-		if !pr.isDuplicate(uint16(i)) {
+	for i := 0; i < maxRecentPackets; i++ {
+		if !pr.isDuplicate(uint64(i)) {
 			t.Errorf("expected %d to be duplicate before wrap", i)
 		}
 	}
 
 	// Add one more value, overwriting index 0 (which held value 0)
-	pr.addChecksum(0xFFFF)
+	pr.remember(0xFFFF)
 
 	// 0xFFFF should be found
 	if !pr.isDuplicate(0xFFFF) {
@@ -84,8 +84,8 @@ func TestDuplicateRingBufferWrap(t *testing.T) {
 	}
 
 	// Values 1..255 should still be present
-	for i := 1; i < maxRecentChecksums; i++ {
-		if !pr.isDuplicate(uint16(i)) {
+	for i := 1; i < maxRecentPackets; i++ {
+		if !pr.isDuplicate(uint64(i)) {
 			t.Errorf("expected %d to still be duplicate after wrap", i)
 		}
 	}
@@ -95,18 +95,18 @@ func TestDuplicateRingBufferOverflow(t *testing.T) {
 	pr := &PacketRelay{}
 
 	// Add 2x the ring size to fully cycle through
-	for i := 0; i < maxRecentChecksums*2; i++ {
-		pr.addChecksum(uint16(i))
+	for i := 0; i < maxRecentPackets*2; i++ {
+		pr.remember(uint64(i))
 	}
 
-	// Only the last maxRecentChecksums values should be present (256..511)
-	for i := 0; i < maxRecentChecksums; i++ {
-		if pr.isDuplicate(uint16(i)) {
+	// Only the last maxRecentPackets values should be present (256..511)
+	for i := 0; i < maxRecentPackets; i++ {
+		if pr.isDuplicate(uint64(i)) {
 			t.Errorf("expected %d to be evicted after full cycle", i)
 		}
 	}
-	for i := maxRecentChecksums; i < maxRecentChecksums*2; i++ {
-		if !pr.isDuplicate(uint16(i)) {
+	for i := maxRecentPackets; i < maxRecentPackets*2; i++ {
+		if !pr.isDuplicate(uint64(i)) {
 			t.Errorf("expected %d to be present", i)
 		}
 	}
@@ -119,13 +119,22 @@ func TestDuplicateDetectionSequentialStress(t *testing.T) {
 	pr := &PacketRelay{}
 
 	for g := 0; g < 10; g++ {
-		base := uint16(g) * 100
-		for i := uint16(0); i < 100; i++ {
-			pr.addChecksum(base + i)
+		base := uint64(g) * 100
+		for i := uint64(0); i < 100; i++ {
+			pr.remember(base + i)
 			if !pr.isDuplicate(base + i) {
 				t.Errorf("expected %d to be duplicate after adding", base+i)
 			}
 		}
+	}
+}
+
+func TestDuplicateExpires(t *testing.T) {
+	pr := &PacketRelay{}
+	pr.remember(0x1234)
+	pr.recent[0].at = pr.recent[0].at.Add(-dedupWindow)
+	if pr.isDuplicate(0x1234) {
+		t.Error("expected the entry to expire after dedupWindow")
 	}
 }
 
@@ -354,25 +363,6 @@ func TestGetBufferLargerThanPool(t *testing.T) {
 		t.Errorf("getBuffer(%d) length = %d", maxPacketSize+1000, len(b))
 	}
 	putBuffer(bp)
-}
-
-// --- isDuplicate checksumCount clamp branch ---
-
-func TestIsDuplicateChecksumCountClamp(t *testing.T) {
-	// Directly set checksumCount beyond maxRecentChecksums to exercise
-	// the clamping branch in isDuplicate.
-	pr := &PacketRelay{}
-	pr.checksumCount = maxRecentChecksums + 10
-	pr.recentChecksums[0] = 0xABCD
-
-	// Should still find the value (clamps search to maxRecentChecksums)
-	if !pr.isDuplicate(0xABCD) {
-		t.Error("expected isDuplicate to find 0xABCD with clamped count")
-	}
-	// Should not find a value that isn't there
-	if pr.isDuplicate(0x1111) {
-		t.Error("expected isDuplicate to not find 0x1111")
-	}
 }
 
 // --- UDP max length alignment test ---
@@ -684,7 +674,11 @@ func TestRemoteSocketsCollectsAll(t *testing.T) {
 }
 
 func TestMaxRemoteMessageLenFitsMaxPacket(t *testing.T) {
-	aes, err := cipher.New("test-key")
+	base, err := cipher.New("test-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	aes, _, err := base.Session(make([]byte, 16), make([]byte, 16))
 	if err != nil {
 		t.Fatal(err)
 	}

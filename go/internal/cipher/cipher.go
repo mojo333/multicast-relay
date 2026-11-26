@@ -18,16 +18,17 @@ import (
 // gives the passphrase a work factor, so a low-entropy shared key is no longer
 // trivially brute-forceable from a captured frame or handshake. The salts are
 // fixed (both relay ends derive the same key from the same passphrase) but
-// distinct, providing domain separation between the AES and HMAC keys.
+// distinct from any other use of the passphrase.
 const (
 	kdfIterations = 210_000
 	kdfKeyLen     = 32
 )
 
-var (
-	aesKDFSalt  = []byte("multicast-relay-kdf-aes-v1")
-	hmacKDFSalt = []byte("multicast-relay-kdf-hmac-v1")
-)
+var hmacKDFSalt = []byte("multicast-relay-kdf-hmac-v1")
+
+// errNoSession is returned when the passphrase-level cipher is asked to protect
+// data. Only the per-connection ciphers from Session can do that.
+var errNoSession = errors.New("cipher: no session key, use Session")
 
 // Cipher handles AES-256-GCM authenticated encryption and HMAC-based peer authentication.
 // GCM provides both confidentiality and integrity — unlike the original CTR mode,
@@ -39,33 +40,19 @@ type Cipher struct {
 }
 
 // New creates a new Cipher. If key is empty, encryption is disabled (passthrough).
-// When key is non-empty, two separate 256-bit keys are derived from the passphrase
-// via PBKDF2-HMAC-SHA256 with distinct salts for domain separation:
-//   - AES key:  PBKDF2(passphrase, aesKDFSalt)
-//   - HMAC key: PBKDF2(passphrase, hmacKDFSalt)
+// Otherwise the result authenticates peers with a key derived from the passphrase
+// via PBKDF2-HMAC-SHA256, and Session provides the ciphers that protect data.
 func New(key string) (*Cipher, error) {
 	c := &Cipher{}
 	if key == "" {
 		return c, nil
 	}
 
-	// Derive the AES-256 key and zero it immediately after loading into the block cipher.
-	aesKey, err := pbkdf2.Key(sha256.New, key, aesKDFSalt, kdfIterations, kdfKeyLen)
-	if err != nil {
-		return nil, fmt.Errorf("cipher: failed to derive AES key: %w", err)
-	}
-	gcm, err := newGCM(aesKey)
-	if err != nil {
-		return nil, err
-	}
-
-	// Derive the HMAC key with a distinct salt so AES key ≠ HMAC key for the same passphrase.
 	hmacKey, err := pbkdf2.Key(sha256.New, key, hmacKDFSalt, kdfIterations, kdfKeyLen)
 	if err != nil {
 		return nil, fmt.Errorf("cipher: failed to derive HMAC key: %w", err)
 	}
 
-	c.gcm = gcm
 	c.hmacKey = hmacKey
 	c.enabled = true
 	return c, nil
@@ -117,41 +104,6 @@ func (c *Cipher) Enabled() bool {
 	return c.enabled
 }
 
-// NonceSize returns the nonce size used by the cipher (12 bytes for GCM).
-// Returns 0 when encryption is disabled.
-func (c *Cipher) NonceSize() int {
-	if !c.enabled {
-		return 0
-	}
-	return c.gcm.NonceSize()
-}
-
-// Overhead returns the authentication tag overhead (16 bytes for GCM).
-// Returns 0 when encryption is disabled.
-func (c *Cipher) Overhead() int {
-	if !c.enabled {
-		return 0
-	}
-	return c.gcm.Overhead()
-}
-
-// Encrypt encrypts and authenticates plaintext using AES-256-GCM.
-// Output format: nonce (12 bytes) || ciphertext || auth tag (16 bytes).
-// If no key, returns plaintext as-is.
-func (c *Cipher) Encrypt(plaintext []byte) ([]byte, error) {
-	if !c.enabled {
-		return plaintext, nil
-	}
-
-	nonce := make([]byte, c.gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return nil, err
-	}
-
-	// Seal appends the ciphertext+tag to nonce
-	return c.gcm.Seal(nonce, nonce, plaintext, nil), nil
-}
-
 // maxFrameBody is the largest frame body the 2-byte length prefix can describe.
 const maxFrameBody = 0xffff
 
@@ -170,6 +122,9 @@ func (c *Cipher) EncryptFrame(plaintext []byte) ([]byte, error) {
 		copy(frame[2:], plaintext)
 		return frame, nil
 	}
+	if c.gcm == nil {
+		return nil, errNoSession
+	}
 	ns := c.gcm.NonceSize()
 	if ns+len(plaintext)+c.gcm.Overhead() > maxFrameBody {
 		return nil, fmt.Errorf("cipher: plaintext too large for frame: %d bytes (max %d)", len(plaintext), maxFrameBody-ns-c.gcm.Overhead())
@@ -185,12 +140,17 @@ func (c *Cipher) EncryptFrame(plaintext []byte) ([]byte, error) {
 	return sealed, nil
 }
 
-// Decrypt decrypts and verifies ciphertext using AES-256-GCM.
+// Decrypt decrypts and verifies a frame body (nonce || ciphertext || tag) using
+// AES-256-GCM.
 // Returns an error if the ciphertext was tampered with or truncated.
 // If no key, returns ciphertext as-is.
 func (c *Cipher) Decrypt(ciphertext []byte) ([]byte, error) {
 	if !c.enabled {
 		return ciphertext, nil
+	}
+
+	if c.gcm == nil {
+		return nil, errNoSession
 	}
 
 	nonceSize := c.gcm.NonceSize()

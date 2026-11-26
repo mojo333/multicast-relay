@@ -136,7 +136,7 @@ func (pr *PacketRelay) deliverRemoteFrame(conn net.Conn, aes *cipher.Cipher, enc
 	copy(pkt, decrypted[16:])
 
 	select {
-	case pr.remotePacketCh <- remotePacket{senderAddr: senderAddr, data: pkt}:
+	case pr.remotePacketCh <- remotePacket{senderAddr: senderAddr, data: pkt, from: conn}:
 	case <-pr.done:
 	}
 	return true
@@ -148,7 +148,7 @@ func (pr *PacketRelay) drainRemotePackets() {
 	for {
 		select {
 		case rp := <-pr.remotePacketCh:
-			pr.processPacket(rp.data, rp.senderAddr, "remote")
+			pr.processPacket(rp.data, rp.senderAddr, "remote", rp.from)
 		case conn := <-pr.remoteFailedCh:
 			pr.removeConnection(conn)
 			conn.Close()
@@ -369,7 +369,12 @@ func (pr *PacketRelay) acceptLoop() {
 			conn = &sessionConn{Conn: conn, send: toClient, recv: toServer}
 		}
 
-		pr.acceptCh <- conn
+		select {
+		case pr.acceptCh <- conn:
+		case <-pr.done:
+			conn.Close()
+			return
+		}
 	}
 }
 

@@ -439,96 +439,6 @@ func TestMulticastIPToMAC(t *testing.T) {
 	})
 }
 
-func TestOnNetwork(t *testing.T) {
-	tests := []struct {
-		ip       netip.Addr
-		network  netip.Prefix
-		expected bool
-	}{
-		{netip.MustParseAddr("192.168.1.100"), netip.MustParsePrefix("192.168.1.0/24"), true},
-		{netip.MustParseAddr("192.168.2.100"), netip.MustParsePrefix("192.168.1.0/24"), false},
-		{netip.MustParseAddr("10.0.0.5"), netip.MustParsePrefix("10.0.0.0/24"), true},
-		{netip.MustParseAddr("10.0.1.5"), netip.MustParsePrefix("10.0.0.0/24"), false},
-		{netip.MustParseAddr("10.0.1.5"), netip.MustParsePrefix("10.0.0.0/16"), true},
-	}
-	for _, tt := range tests {
-		got := OnNetwork(tt.ip, tt.network)
-		if got != tt.expected {
-			t.Errorf("OnNetwork(%s, %s) = %v, want %v", tt.ip, tt.network, got, tt.expected)
-		}
-	}
-}
-
-func TestCIDRToNetmask(t *testing.T) {
-	tests := []struct {
-		bits     int
-		expected string
-	}{
-		{24, "255.255.255.0"},
-		{16, "255.255.0.0"},
-		{8, "255.0.0.0"},
-		{32, "255.255.255.255"},
-		{20, "255.255.240.0"},
-	}
-	for _, tt := range tests {
-		got := CIDRToNetmask(tt.bits)
-		if got != tt.expected {
-			t.Errorf("CIDRToNetmask(%d) = %s, want %s", tt.bits, got, tt.expected)
-		}
-	}
-}
-
-func TestIP2LongRoundTrip(t *testing.T) {
-	ips := []string{"0.0.0.0", "192.168.1.1", "255.255.255.255", "10.0.0.1", "172.16.0.1"}
-	for _, ip := range ips {
-		got := Long2IP(IP2Long(ip))
-		if got != ip {
-			t.Errorf("round-trip failed for %s: got %s", ip, got)
-		}
-	}
-}
-
-func TestIP2LongInvalid(t *testing.T) {
-	tests := []struct {
-		name string
-		ip   string
-	}{
-		{"empty string", ""},
-		{"garbage", "not-an-ip"},
-		{"IPv6", "::1"},
-		{"out of range", "999.999.999.999"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := IP2Long(tt.ip); got != 0 {
-				t.Errorf("IP2Long(%q) = %d, want 0", tt.ip, got)
-			}
-		})
-	}
-}
-
-func TestLong2IP(t *testing.T) {
-	tests := []struct {
-		input    uint32
-		expected string
-	}{
-		{0x00000000, "0.0.0.0"},
-		{0xc0a80101, "192.168.1.1"},
-		{0xffffffff, "255.255.255.255"},
-		{0x0a000001, "10.0.0.1"},
-		{0xac100001, "172.16.0.1"},
-		{0x7f000001, "127.0.0.1"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.expected, func(t *testing.T) {
-			got := Long2IP(tt.input)
-			if got != tt.expected {
-				t.Errorf("Long2IP(0x%08x) = %s, want %s", tt.input, got, tt.expected)
-			}
-		})
-	}
-}
-
 func TestBroadcastIPToMAC(t *testing.T) {
 	mac := BroadcastIPToMAC()
 	expected := net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
@@ -689,28 +599,6 @@ func TestComputeUDPChecksum(t *testing.T) {
 			t.Errorf("UDP checksum = 0x%04x, want 0xffff", gotChecksum)
 		}
 	})
-}
-
-func TestOnNetworkPrefix(t *testing.T) {
-	prefix := netip.MustParsePrefix("192.168.1.0/24")
-	tests := []struct {
-		name     string
-		ip       netip.Addr
-		expected bool
-	}{
-		{"in range", netip.MustParseAddr("192.168.1.100"), true},
-		{"network address", netip.MustParseAddr("192.168.1.0"), true},
-		{"broadcast", netip.MustParseAddr("192.168.1.255"), true},
-		{"out of range", netip.MustParseAddr("192.168.2.1"), false},
-		{"zero addr", netip.Addr{}, false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := OnNetworkPrefix(tt.ip, prefix); got != tt.expected {
-				t.Errorf("OnNetworkPrefix(%s, %s) = %v, want %v", tt.ip, prefix, got, tt.expected)
-			}
-		})
-	}
 }
 
 func TestAddrFrom4Bytes(t *testing.T) {

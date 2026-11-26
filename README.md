@@ -34,6 +34,9 @@ established.
 
 `usage: multicast-relay-<platform> --interfaces INTERFACE [INTERFACE ...] [--noTransmitInterfaces INTERFACE ...] [--ifFilter IFFILTER] [--ssdpUnicastAddr ADDR] [--relay BROADCAST_OR_MULTICAST:PORT ...] [--noMDNS] [--mdnsForceUnicast] [--noSSDP] [--noSonosDiscovery] [--oneInterface] [--allowNonEther] [--masquerade INTERFACE ...] [--wait] [--ttl TTL] [--listen REMOTE_ADDRESS ...] [--remote REMOTE_ADDRESS ...] [--remotePort PORT] [--remoteRetry SECS] [--noRemoteRelay] [--aes KEY] [--drop-user USER] [--foreground] [--logfile FILE] [--verbose] [--monitor FILE]`
 
+Options that take several values accept them after one flag
+(`--interfaces br0 br50`) or as repeated flags.
+
 `--interfaces` specifies the >= 2 interfaces that you desire to listen to and
 relay between. You can specify an interface by name, by IP address, or by
 network/netmask combination (e.g. 10.0.0.0/24 in the last case). With certain
@@ -44,12 +47,25 @@ flags below, the minimum number of interfaces drops to >= 1.
 `--ifFilter` specifies a JSON file where one can state that a source address
 A.B.C.D/M is only to be relayed to specific interfaces. This can be useful
 in applications such as a hotel where relaying for one guest room may only
-discover device(s) that are in the same guest room. See example file
-`ifFilter.json`.
+discover device(s) that are in the same guest room. For example:
+
+```json
+{
+  "10.0.0.0/16": ["br0", "br50"],
+  "10.0.1.5": ["br0"]
+}
+```
+
+Where several rules match a source, the most specific one applies. A source that
+matches no rule is relayed everywhere. Use interface names, not addresses. The
+filter covers local interfaces only: it does not limit what is sent to remote
+relays.
 
 `--ssdpUnicastAddr` specifies an IP address to listen on for SSDP unicast replies.
 
-`--relay` specifies additional broadcast or multicast addresses to relay.
+`--relay` specifies additional broadcast or multicast addresses to relay. Use
+`255.255.255.255:PORT` for broadcasts, which covers both that address and each
+interface's own broadcast address.
 
 `--noMDNS` disables mDNS relaying.
 
@@ -72,9 +88,15 @@ interface(s) to that interface's own address, similar to NAT masquerading.
 to each interface rather than bailing immediately if an interface is yet to be
 assigned an address.
 
+If a listed interface is later recreated or given a new address, the relay
+notices within a few seconds and reopens its sockets once every listed interface
+is available. With `--drop-user` it no longer has permission to do that, so it
+exits with an error: run it under a service manager that restarts it.
+
 `--ttl` sets the TTL on outbound packets (1-255); default leaves the TTL unchanged.
 
-`--listen` for connections from the specified remote host(s).
+`--listen` for connections from the specified remote host(s), given as IPv4
+addresses.
 
 `--remote` connect to the specified remote host. If either --listen or --remote
 are specified, then one can also specify just one local interface with --interfaces.
@@ -83,7 +105,8 @@ are specified, then one can also specify just one local interface with --interfa
 
 `--remoteRetry` if the remote connection fails, wait at least this number of seconds before retrying (default: 5).
 
-`--noRemoteRelay` only relay on local interfaces, ignoring any --listen/--remote configuration.
+`--noRemoteRelay` do not pass packets received from one remote relay on to
+others. Local packets are still sent to remote relays.
 
 `--aes` use the specified string to encrypt/decrypt data packets sent to remote
 relays. Can also be set via the `MULTICAST_RELAY_AES_KEY` environment variable.
@@ -95,8 +118,8 @@ same time. Mixed versions do not relay to each other.
 `--drop-user` drop root privileges to this unprivileged user after socket setup
 (Linux only, requires starting as root).
 
-`--foreground` stops the process forking itself off into the background. This
-flag also encourages logging to stdout as well as to the syslog.
+`--foreground` also logs to stdout as well as to the syslog. The relay never
+moves itself to the background, so use `nohup` or a service manager for that.
 
 `--logfile` saves log data to the specified file.
 

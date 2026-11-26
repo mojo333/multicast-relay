@@ -22,14 +22,15 @@ func TestBouncedRemotePacketIsDroppedWhenTTLRewrites(t *testing.T) {
 	defer local.Close()
 	defer peer.Close()
 	pr.connectedRemotes = []net.Conn{local}
+	addRule(pr, SSDPMcastAddr, SSDPMcastPort)
 
 	packet := minUDPTestPacket("192.168.1.100", "239.255.255.250", 1234, 1900)
 	ComputeIPChecksum(packet, 20)
 	bounced := append([]byte(nil), packet...) // processPacket rewrites the TTL in place
 	sender := netip.MustParseAddr("192.168.1.100")
 
-	pr.processPacket(packet, sender, "local")
-	pr.processPacket(bounced, sender, "remote")
+	pr.processPacket(packet, sender, "local", nil)
+	pr.processPacket(bounced, sender, "remote", nil)
 
 	if pr.remoteSeq != 1 {
 		t.Errorf("packet forwarded to remotes %d times, want 1", pr.remoteSeq)
@@ -114,8 +115,8 @@ func captureFrame(t *testing.T, client *PacketRelay, clientConn, serverConn net.
 	t.Helper()
 	client.connectedRemotes, client.connsDirty = []net.Conn{clientConn}, false
 	packet := minUDPTestPacket("192.168.1.100", "239.255.255.250", 1234, 1900)
-	client.checksumCount, client.checksumIdx = 0, 0 // allow the same packet again
-	client.processPacket(packet, netip.MustParseAddr("192.168.1.100"), "local")
+	client.recent = [maxRecentPackets]seenPacket{} // allow the same packet again
+	client.processPacket(packet, netip.MustParseAddr("192.168.1.100"), "local", nil)
 
 	serverConn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	defer serverConn.SetReadDeadline(time.Time{})
@@ -158,6 +159,7 @@ func TestRemoteFramesAreBoundToOneConnectionAndDirection(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(pr.Close)
+		addRule(pr, SSDPMcastAddr, SSDPMcastPort)
 		return pr
 	}
 	server := newRelay([]string{"127.0.0.1"}, nil)
@@ -170,9 +172,9 @@ func TestRemoteFramesAreBoundToOneConnectionAndDirection(t *testing.T) {
 		s, c := connectPair(t, server, client)
 		server.startReader(s)
 		client.connectedRemotes, client.connsDirty = []net.Conn{c}, false
-		client.checksumCount, client.checksumIdx = 0, 0
+		client.recent = [maxRecentPackets]seenPacket{}
 		client.processPacket(minUDPTestPacket("192.168.1.100", "239.255.255.250", 1234, 1900),
-			netip.MustParseAddr("192.168.1.100"), "local")
+			netip.MustParseAddr("192.168.1.100"), "local", nil)
 		select {
 		case <-server.remotePacketCh:
 		case <-time.After(2 * time.Second):

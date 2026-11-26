@@ -6,6 +6,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net/netip"
 	"os"
 	"os/signal"
 	"os/user"
@@ -59,25 +60,30 @@ func run() int {
 	flag.Var(&masquerade, "masquerade", "Masquerade outbound packets from these interface(s).")
 	waitForIP := flag.Bool("wait", false, "Wait for IPv4 address assignment.")
 	ttl := flag.Int("ttl", 0, "Set TTL on outbound packets (1-255).")
-	flag.Var(&listenAddrs, "listen", "Listen for remote connections from these addresses.")
+	flag.Var(&listenAddrs, "listen", "Listen for remote connections from these IPv4 addresses.")
 	flag.Var(&remoteAddrs, "remote", "Relay packets to remote multicast-relay(s).")
 	remotePort := flag.Int("remotePort", 1900, "Port for remote relay communications.")
 	remoteRetry := flag.Int("remoteRetry", 5, "Retry interval (seconds) for failed remote connections.")
-	noRemoteRelay := flag.Bool("noRemoteRelay", false, "Only relay on local interfaces.")
+	noRemoteRelay := flag.Bool("noRemoteRelay", false, "Do not pass packets received from one remote relay on to others.")
 	aesKey := flag.String("aes", "", "AES encryption key for remote relay connections (or set MULTICAST_RELAY_AES_KEY env var).")
 	dropUser := flag.String("drop-user", "", "Drop to this unprivileged user after socket setup (Linux only; requires root).")
-	foreground := flag.Bool("foreground", false, "Do not background, log to stdout.")
+	foreground := flag.Bool("foreground", false, "Also log to stdout. The relay never moves itself to the background.")
 	logfile := flag.String("logfile", "", "Save logs to this file.")
 	verbose := flag.Bool("verbose", false, "Enable verbose output.")
 	monitor := flag.String("monitor", "", "Write startup, errors, and shutdown events to this log file.")
 
-	// Parse with support for space-separated values after a single flag
-	flag.Parse()
-
-	// Collect remaining args as additional interfaces (for compatibility: --interfaces eth0 eth1)
-	// Go's flag package doesn't natively support nargs='+', so we handle trailing args.
+	// Go's flag package takes one value per flag, so repeat the flag before each
+	// further value of a list: --interfaces eth0 eth1.
+	args, err := expandListArgs(flag.CommandLine, os.Args[1:])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	// CommandLine exits on a parse error, as flag.Parse does.
+	_ = flag.CommandLine.Parse(args)
 	if flag.NArg() > 0 {
-		interfaces = append(interfaces, flag.Args()...)
+		fmt.Fprintf(os.Stderr, "Unexpected arguments: %s\n", strings.Join(flag.Args(), " "))
+		return 1
 	}
 
 	// AES key: --aes flag takes precedence; fall back to environment variable.
@@ -99,10 +105,10 @@ func run() int {
 			return 1
 		}
 	}
-	// Validate listen addresses (must be valid IPs).
+	// Listen addresses are compared with the peer's IPv4 address.
 	for _, addr := range listenAddrs {
-		if strings.TrimSpace(addr) == "" {
-			fmt.Fprintln(os.Stderr, "--listen: empty address")
+		if err := validateListenAddr(addr); err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid --listen value: %s\n", err)
 			return 1
 		}
 	}
@@ -309,6 +315,48 @@ func run() int {
 
 	log.Monitor("Process exiting: clean shutdown")
 	return 0
+}
+
+// expandListArgs rewrites "--list a b" as "--list a --list b" for the flags that
+// hold a list. A loose value that follows no list flag is an error.
+func expandListArgs(flags *flag.FlagSet, args []string) ([]string, error) {
+	var out []string
+	list := "" // the list flag that loose values belong to
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if len(arg) < 2 || arg[0] != '-' {
+			if list == "" {
+				return nil, fmt.Errorf("unexpected argument %q", arg)
+			}
+			out = append(out, list, arg)
+			continue
+		}
+		out = append(out, arg)
+		name, _, inline := strings.Cut(strings.TrimLeft(arg, "-"), "=")
+		list = ""
+		f := flags.Lookup(name)
+		if f == nil {
+			return append(out, args[i+1:]...), nil // let Parse report it
+		}
+		if _, ok := f.Value.(*stringSlice); ok {
+			list = "--" + name
+		}
+		boolean, ok := f.Value.(interface{ IsBoolFlag() bool })
+		if !inline && !(ok && boolean.IsBoolFlag()) && i+1 < len(args) {
+			i++
+			out = append(out, args[i])
+		}
+	}
+	return out, nil
+}
+
+// validateListenAddr requires an IPv4 address, because host names would never
+// match a connecting peer.
+func validateListenAddr(addr string) error {
+	if ip, err := netip.ParseAddr(addr); err != nil || !ip.Is4() {
+		return fmt.Errorf("%q is not an IPv4 address", addr)
+	}
+	return nil
 }
 
 // validateInterfaceSpec rejects obviously invalid interface specifications before passing them

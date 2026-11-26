@@ -3,6 +3,7 @@ package relay
 import (
 	"net"
 	"net/netip"
+	"sync"
 	"time"
 
 	"github.com/mojo333/multicast-relay/internal/cipher"
@@ -16,6 +17,7 @@ import (
 type remotePacket struct {
 	senderAddr netip.Addr
 	data       []byte
+	from       net.Conn // the connection it arrived on, which must not get it back
 }
 
 // sessionConn is an authenticated remote connection together with the keys that
@@ -64,11 +66,39 @@ type Transmitter struct {
 	Broadcast netip.Addr   // interface broadcast address
 	Socket    int          // raw AF_PACKET socket fd
 	Service   string
+	// sendFailing keeps a dead interface from logging every packet.
+	sendFailing bool
 }
 
 // Receiver wraps a raw receive socket fd.
 type Receiver struct {
-	fd int
+	fd    int
+	port  int    // raw sockets see every UDP port, so the loop filters on this one
+	iface string // set when the socket is bound to one interface
+	// readdressAs replaces a limited broadcast destination with the arrival
+	// interface's broadcast address, so that one code path relays both.
+	readdressAs netip.Addr
+}
+
+// relayRule is one relayed address and port.
+type relayRule struct {
+	addr    netip.Addr
+	port    int
+	service string
+}
+
+// listedInterface is an interface named in --interfaces, whether or not packets
+// are transmitted on it, as it looked when its sockets were opened.
+type listedInterface struct {
+	spec    string
+	info    InterfaceResult
+	missing bool // already reported as unusable
+}
+
+// seenPacket is one entry of the duplicate filter.
+type seenPacket struct {
+	key uint64
+	at  time.Time
 }
 
 // connectResult carries the outcome of an async remote dial attempt.
@@ -122,8 +152,11 @@ type PacketRelay struct {
 
 	logger *logger.Logger
 
+	relays       []relayRule
+	listed       []listedInterface
 	transmitters []Transmitter
 	receivers    []Receiver
+	reopenFailed bool                            // a failed reopening has been reported
 	etherAddrs   map[netip.Addr]net.HardwareAddr // multicast/broadcast IP → MAC
 
 	// ssdpSrc tracks the most recent SSDP M-SEARCH source for unicast reply routing.
@@ -132,9 +165,8 @@ type PacketRelay struct {
 
 	// Ring buffer for duplicate detection.
 	// Only accessed from the single-threaded main loop (Loop -> processPacket).
-	recentChecksums [maxRecentChecksums]uint16
-	checksumIdx     int
-	checksumCount   int
+	recent    [maxRecentPackets]seenPacket
+	recentIdx int
 
 	listenAddr        []string
 	listener          *net.TCPListener
@@ -166,5 +198,6 @@ type PacketRelay struct {
 	pollDirty bool
 
 	// done signals Loop() to exit cleanly.
-	done chan struct{}
+	done      chan struct{}
+	closeOnce sync.Once
 }
