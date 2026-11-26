@@ -21,7 +21,7 @@ func TestNewForegroundVerbose(t *testing.T) {
 }
 
 func TestNewBackgroundNonVerbose(t *testing.T) {
-	// No foreground, no logfile — should get a discard handler fallback
+	// No foreground and no logfile, so the discard handler fallback applies
 	l, err := New(false, "", false)
 	if err != nil {
 		t.Fatalf("New(foreground=false, verbose=false) error: %v", err)

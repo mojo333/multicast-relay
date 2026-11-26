@@ -30,9 +30,10 @@ var hmacKDFSalt = []byte("multicast-relay-kdf-hmac-v1")
 // data. Only the per-connection ciphers from Session can do that.
 var errNoSession = errors.New("cipher: no session key, use Session")
 
-// Cipher handles AES-256-GCM authenticated encryption and HMAC-based peer authentication.
-// GCM provides both confidentiality and integrity — unlike the original CTR mode,
-// tampered ciphertext is detected and rejected.
+// Cipher handles HMAC-based peer authentication and AES-256-GCM encryption. One
+// made by New authenticates peers and derives keys, while those made by Session
+// protect a connection's data. Unlike the original CTR mode, GCM detects and
+// rejects tampered ciphertext.
 type Cipher struct {
 	gcm     cipher.AEAD
 	hmacKey []byte // retained for challenge-response peer authentication
@@ -111,7 +112,7 @@ const maxFrameBody = 0xffff
 // [2-byte big-endian length][nonce(12)][ciphertext+tag] when AES is enabled,
 // or [2-byte length][plaintext] when AES is disabled.
 // Returns an error if the frame body would exceed what the length prefix can
-// represent — without this, the uint16 cast would silently corrupt the framing.
+// represent, because the uint16 cast would otherwise silently corrupt the framing.
 func (c *Cipher) EncryptFrame(plaintext []byte) ([]byte, error) {
 	if !c.enabled {
 		if len(plaintext) > maxFrameBody {

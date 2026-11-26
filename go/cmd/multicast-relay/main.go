@@ -37,7 +37,7 @@ func main() {
 	os.Exit(run())
 }
 
-// run parses flags, configures the relay, and runs the event loop.
+// run parses flags, configures the relay and runs the event loop.
 func run() int {
 	var interfaces stringSlice
 	var noTransmitInterfaces stringSlice
@@ -49,15 +49,15 @@ func run() int {
 	flag.Var(&interfaces, "interfaces", "Relay between these interfaces (specify multiple times or space-separated).")
 	flag.Var(&noTransmitInterfaces, "noTransmitInterfaces", "Do not relay packets via these interfaces, listen only.")
 	ifFilter := flag.String("ifFilter", "", "JSON file specifying which interface(s) a particular source IP can relay to.")
-	ssdpUnicastAddr := flag.String("ssdpUnicastAddr", "", "IP address to listen to SSDP unicast replies.")
+	ssdpUnicastAddr := flag.String("ssdpUnicastAddr", "", "IP address of this host to listen on for SSDP unicast replies.")
 	oneInterface := flag.Bool("oneInterface", false, "Only one interface exists, connected to two networks.")
 	flag.Var(&relayAddrs, "relay", "Relay additional multicast/broadcast address(es) in A.B.C.D:PORT format.")
 	noMDNS := flag.Bool("noMDNS", false, "Do not relay mDNS packets.")
-	mdnsForceUnicast := flag.Bool("mdnsForceUnicast", false, "Force mDNS packets to have the UNICAST-RESPONSE bit set.")
+	mdnsForceUnicast := flag.Bool("mdnsForceUnicast", false, "Force mDNS queries to have the UNICAST-RESPONSE bit set.")
 	noSSDP := flag.Bool("noSSDP", false, "Do not relay SSDP packets.")
 	noSonosDiscovery := flag.Bool("noSonosDiscovery", false, "Do not relay broadcast Sonos discovery packets.")
 	allowNonEther := flag.Bool("allowNonEther", false, "Allow non-ethernet interfaces to be configured.")
-	flag.Var(&masquerade, "masquerade", "Masquerade outbound packets from these interface(s).")
+	flag.Var(&masquerade, "masquerade", "Rewrite the source address of packets sent out of these interfaces to the interface address.")
 	waitForIP := flag.Bool("wait", false, "Wait for IPv4 address assignment.")
 	ttl := flag.Int("ttl", 0, "Set TTL on outbound packets (1-255).")
 	flag.Var(&listenAddrs, "listen", "Listen for remote connections from these IPv4 addresses.")
@@ -70,7 +70,7 @@ func run() int {
 	foreground := flag.Bool("foreground", false, "Also log to stdout. The relay never moves itself to the background.")
 	logfile := flag.String("logfile", "", "Save logs to this file.")
 	verbose := flag.Bool("verbose", false, "Enable verbose output.")
-	monitor := flag.String("monitor", "", "Write startup, errors, and shutdown events to this log file.")
+	monitor := flag.String("monitor", "", "Write startup, shutdown, warning and error events to this log file.")
 
 	// Go's flag package takes one value per flag, so repeat the flag before each
 	// further value of a list: --interfaces eth0 eth1.
@@ -92,7 +92,7 @@ func run() int {
 		aesKeyVal = os.Getenv("MULTICAST_RELAY_AES_KEY")
 	}
 
-	// Validate interface name specs (name, IP, or CIDR): non-empty, max 100 chars.
+	// Validate interface name specs (name, IP or CIDR): non-empty, max 100 chars.
 	for _, iface := range interfaces {
 		if err := validateInterfaceSpec(iface); err != nil {
 			fmt.Fprintf(os.Stderr, "Invalid --interfaces value: %s\n", err)
@@ -133,10 +133,9 @@ func run() int {
 		return 1
 	}
 
-	// Daemonize if not foreground
+	// The relay does not fork into the background. Without --foreground it only
+	// closes stdin, so use nohup or a service manager to run it as a daemon.
 	if !*foreground {
-		// In Go we don't fork; instead we just detach stdin.
-		// For true daemonization, use systemd or similar.
 		os.Stdin.Close()
 	}
 

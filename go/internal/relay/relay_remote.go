@@ -28,7 +28,7 @@ func (pr *PacketRelay) startReader(conn net.Conn) {
 }
 
 // runReader reads length-prefixed frames from a single remote connection,
-// decrypts and validates them, and delivers decoded packets to the main loop via
+// decrypts and validates them and delivers decoded packets to the main loop via
 // remotePacketCh. On any fatal error it reports the connection on remoteFailedCh
 // and exits. It owns all per-connection read state, so no locking is needed.
 func (pr *PacketRelay) runReader(conn net.Conn) {
@@ -257,7 +257,7 @@ func (pr *PacketRelay) dialRemote(ra *RemoteAddr) {
 
 // sendConnectResult delivers a dial outcome to the main loop. If the relay has
 // been closed, nothing drains connectResultCh anymore, so it discards the
-// result instead — otherwise the dial goroutine would block forever.
+// result instead, because the dial goroutine would otherwise block forever.
 func (pr *PacketRelay) sendConnectResult(res connectResult) {
 	select {
 	case pr.connectResultCh <- res:
@@ -378,7 +378,7 @@ func (pr *PacketRelay) acceptLoop() {
 	}
 }
 
-// hasUnconnectedRemotes returns true if any remote is disconnected, not actively dialing,
+// hasUnconnectedRemotes returns true if any remote is disconnected, not actively dialling
 // and past its retry backoff window.
 func (pr *PacketRelay) hasUnconnectedRemotes() bool {
 	for _, ra := range pr.remoteAddrs {

@@ -5,7 +5,7 @@ This is a port to Go of Al Smith's brilliant multicast-relay
 implementation originally written in Python. Additional fixes and
 optimisations have been made.
 
-To run this on an Unifi Dream Machine Pro use the command
+To run this on a UniFi Dream Machine Pro use the command
 
 `nohup /data/multicast-relay/multicast-relay-arm64 --interfaces br0 br50 br99 </dev/null >/dev/null 2>&1 &`
 
@@ -25,6 +25,14 @@ this is used by Sonos during the initial device-discovery phase, initiated
 by pressing either the infinity button or the play+volume up buttons,
 depending on your Sonos speaker.
 
+Packets that the relay's own host sends from a listed interface's address are
+not copied to the other local interfaces. Services on the host, such as a
+router's own discovery, choose which networks to send on, so copying their
+packets would put them on networks they did not choose. A service that sends on
+only one network is therefore not heard on the others. These packets are still
+sent to remote relays. Only one address per interface is recognised, so packets
+sent from a secondary address are copied as usual.
+
 Please note that even when your devices have discovered one another, at
 least in the Sonos case, a unicast connection will be established from
 the speakers back to the controlling-telephone. You will need to make sure
@@ -38,9 +46,10 @@ Options that take several values accept them after one flag
 (`--interfaces br0 br50`) or as repeated flags.
 
 `--interfaces` specifies the >= 2 interfaces that you desire to listen to and
-relay between. You can specify an interface by name, by IP address, or by
+relay between. You can specify an interface by name, by IP address or by
 network/netmask combination (e.g. 10.0.0.0/24 in the last case). With certain
-flags below, the minimum number of interfaces drops to >= 1.
+flags below, the minimum number of interfaces drops to >= 1. Traffic from
+interfaces that are not listed is not relayed.
 
 `--noTransmitInterfaces` specifies interface(s) that are listen-only.
 
@@ -56,12 +65,15 @@ discover device(s) that are in the same guest room. For example:
 }
 ```
 
-Where several rules match a source, the most specific one applies. A source that
-matches no rule is relayed everywhere. Use interface names, not addresses. The
-filter covers local interfaces only: it does not limit what is sent to remote
-relays.
+Where several rules match a source, the most specific one applies, and two rules
+for the same range stop the relay at start-up. A source that matches no rule is
+relayed everywhere. Use interface names, not addresses. The filter covers local
+interfaces only: it does not limit what is sent to remote relays.
 
-`--ssdpUnicastAddr` specifies an IP address to listen on for SSDP unicast replies.
+`--ssdpUnicastAddr` specifies one of this host's IP addresses to listen on for
+SSDP unicast replies. Relayed searches carry this address and port 1901 as their
+source, and replies are passed back to the most recent searcher. Replies are only
+accepted from listed networks, except with `--oneInterface`.
 
 `--relay` specifies additional broadcast or multicast addresses to relay. Use
 `255.255.255.255:PORT` for broadcasts, which covers both that address and each
@@ -69,15 +81,16 @@ interface's own broadcast address.
 
 `--noMDNS` disables mDNS relaying.
 
-`--mdnsForceUnicast` forces relayed mDNS packets to have the UNICAST-RESPONSE bit set.
+`--mdnsForceUnicast` forces relayed mDNS queries to have the UNICAST-RESPONSE bit set.
 
 `--noSSDP` disables SSDP relaying.
 
 `--noSonosDiscovery` disables broadcast udp/6969 relaying.
 
-`--oneInterface` support for one interface connected to two networks. Use with
-caution - watch out for packet storms (although the IP checksum list ought
-to still prevent such a thing from happening).
+`--oneInterface` supports one interface connected to two networks. Packets from
+senders outside the interface's own subnet are relayed back out of it. Use with
+caution and watch out for packet storms, although the duplicate filter, which
+ignores a repeat of a packet seen in the last 2 seconds, ought to prevent them.
 
 `--allowNonEther` supports non-ethernet interfaces to be relayed [experimental].
 
@@ -91,40 +104,62 @@ assigned an address.
 If a listed interface is later recreated or given a new address, the relay
 notices within a few seconds and reopens its sockets once every listed interface
 is available. An interface listed by address or CIDR block is followed by its
-name if that no longer matches. With `--drop-user` it no longer has permission to do that, so it
-exits with an error: run it under a service manager that restarts it.
+name if that no longer matches. With `--drop-user` the relay no longer has
+permission to reopen sockets, so it exits with an error: run it under a service
+manager that restarts it.
 
 `--ttl` sets the TTL on outbound packets (1-255); default leaves the TTL unchanged.
 
-`--listen` for connections from the specified remote host(s), given as IPv4
-addresses.
+`--listen` accepts connections on `--remotePort` from the specified remote
+relay(s), given as IPv4 addresses.
 
-`--remote` connect to the specified remote host. If either --listen or --remote
-are specified, then one can also specify just one local interface with --interfaces.
+`--remote` connects to the specified remote relay(s). A relay uses either
+`--listen` or `--remote`, not both, and with either of them one local interface in
+`--interfaces` is enough.
 
-`--remotePort` use the specified port for remote communications (default: 1900).
+`--remotePort` sets the port for remote communications (default: 1900).
 
-`--remoteRetry` if the remote connection fails, wait at least this number of seconds before retrying (default: 5).
+`--remoteRetry` sets the minimum number of seconds to wait before retrying a
+failed remote connection (default: 5).
 
-`--noRemoteRelay` do not pass packets received from one remote relay on to
+`--noRemoteRelay` stops packets received from one remote relay being passed on to
 others. Local packets are still sent to remote relays.
 
-`--aes` use the specified string to encrypt/decrypt data packets sent to remote
-relays. Can also be set via the `MULTICAST_RELAY_AES_KEY` environment variable.
+`--aes` uses the specified string to authenticate remote relays to each other and
+to encrypt the packets sent between them. Without it the traffic is unencrypted
+and a listening relay trusts any connection from a `--listen` address. The key can
+also be set in the `MULTICAST_RELAY_AES_KEY` environment variable, which keeps it
+out of the process list.
 
-**Upgrading from v2.8 or earlier:** the remote protocol has changed, with or
-without `--aes`, so every `--listen` and `--remote` peer must be upgraded at the
-same time. Mixed versions do not relay to each other.
-
-`--drop-user` drop root privileges to this unprivileged user after socket setup
+`--drop-user` drops root privileges to this unprivileged user after socket setup
 (Linux only, requires starting as root).
 
-`--foreground` also logs to stdout as well as to the syslog. The relay never
-moves itself to the background, so use `nohup` or a service manager for that.
+`--foreground` logs to stdout as well as to the syslog. The relay never moves
+itself to the background, so use `nohup` or a service manager for that.
 
 `--logfile` saves log data to the specified file.
 
-`--verbose` steps up the logging.
+`--verbose` also logs informational messages, including a line for every relayed
+packet. Without it only warnings and errors are logged.
 
-`--monitor` writes startup, error, and shutdown events to the specified log file.
+`--monitor` writes startup, shutdown, warning and error events to the specified
+log file.
+
+Upgrading from v2.8 or earlier
+------------------------------
+
+- The remote protocol has changed, with or without `--aes`, so every `--listen`
+  and `--remote` peer must be upgraded at the same time. Mixed versions do not
+  relay to each other.
+- Traffic from interfaces that are not listed is no longer relayed.
+- A value after a list option now belongs to that option, where v2.8 added loose
+  values to `--interfaces`.
+- A loose value after any other option, a `--listen` host name and two
+  `--ifFilter` rules for one range now stop the relay at start-up.
+- Only traffic matching a relay rule is sent to remote relays.
+- SSDP unicast replies are accepted only from listed networks and sent only to the
+  searcher's network.
+- With `--drop-user`, a recreated or readdressed interface makes the relay exit.
+- Packets sent by the relay's own host are no longer copied between local
+  interfaces.
 

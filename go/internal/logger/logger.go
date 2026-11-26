@@ -32,7 +32,7 @@ func New(foreground bool, logfile string, verbose bool) (*Logger, error) {
 	if err == nil {
 		handlers = append(handlers, slog.NewTextHandler(syslogWriter{sw}, &slog.HandlerOptions{
 			Level: level,
-			// Strip timestamp — syslog adds its own.
+			// Strip timestamp because syslog adds its own.
 			ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
 				if a.Key == slog.TimeKey {
 					return slog.Attr{}

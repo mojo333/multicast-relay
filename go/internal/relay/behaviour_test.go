@@ -266,6 +266,32 @@ func TestSendFailureIsLoggedOnceUntilItRecovers(t *testing.T) {
 	}
 }
 
+func TestHostPacketsAreNotCopiedBetweenLocalNetworks(t *testing.T) {
+	a, _ := socketTransmitter(t, "a", "192.168.1.1")
+	b, out := ssdpTransmitter(t, "b", "192.168.2.1")
+	pr := newLocalTestRelay(t, a, b)
+	defer close(pr.done)
+	local, peer := net.Pipe()
+	defer local.Close()
+	defer peer.Close()
+	pr.connectedRemotes = []net.Conn{local}
+	own := netip.MustParseAddr("192.168.1.1")
+
+	deliver(pr, ssdpPacket("192.168.1.1", SSDPMcastAddr, "from this host"), own, "local")
+	if got := sentCount(out); got != 0 {
+		t.Errorf("host's own packet copied %d times, want 0", got)
+	}
+	// The host has no interface on a remote site, so that site still needs it.
+	if pr.remoteSeq != 1 {
+		t.Errorf("host's own packet forwarded to remotes %d times, want 1", pr.remoteSeq)
+	}
+	// A remote site may use the same addresses as this one.
+	deliver(pr, ssdpPacket("192.168.1.1", SSDPMcastAddr, "from a remote site"), own, "remote")
+	if got := sentCount(out); got != 1 {
+		t.Errorf("remote packet relayed %d times, want 1", got)
+	}
+}
+
 func TestCloseLeavesSocketCleanUpToLoop(t *testing.T) {
 	tx, _ := socketTransmitter(t, "a", "192.168.1.1")
 	fd, err := unix.Dup(tx.Socket)

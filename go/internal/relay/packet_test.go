@@ -538,7 +538,7 @@ func TestComputeUDPChecksum(t *testing.T) {
 		if len(result) != 8 {
 			t.Fatalf("result length = %d, want 8", len(result))
 		}
-		// Src port, dst port, and length should be preserved
+		// Src port, dst port and length should be preserved
 		if !bytes.Equal(result[:6], udpHeader[:6]) {
 			t.Errorf("first 6 bytes changed: got %v, want %v", result[:6], udpHeader[:6])
 		}
