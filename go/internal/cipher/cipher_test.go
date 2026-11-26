@@ -15,14 +15,49 @@ func mustNew(t *testing.T, key string) *Cipher {
 	return c
 }
 
+// overhead is the 12-byte GCM nonce plus the 16-byte tag.
+const overhead = 12 + 16
+
+// mustSession returns a cipher that can protect data: a session cipher when key
+// is set and the passthrough cipher when it is not.
+func mustSession(t *testing.T, key string) *Cipher {
+	t.Helper()
+	c := mustNew(t, key)
+	if !c.Enabled() {
+		return c
+	}
+	toServer, _, err := c.Session(make([]byte, 16), make([]byte, 16))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return toServer
+}
+
+// seal returns the frame body for plaintext, without the length prefix.
+func seal(t *testing.T, c *Cipher, plaintext []byte) []byte {
+	t.Helper()
+	frame, err := c.EncryptFrame(plaintext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return frame[2:]
+}
+
+func TestPassphraseCipherCannotProtectData(t *testing.T) {
+	c := mustNew(t, "secret")
+	if _, err := c.EncryptFrame([]byte("data")); err == nil {
+		t.Error("EncryptFrame without a session key must fail, not send anything")
+	}
+	if _, err := c.Decrypt(make([]byte, 64)); err == nil {
+		t.Error("Decrypt without a session key must fail")
+	}
+}
+
 func TestCipherDisabled(t *testing.T) {
 	c := mustNew(t, "")
 	plaintext := []byte("hello world")
 
-	encrypted, err := c.Encrypt(plaintext)
-	if err != nil {
-		t.Fatal(err)
-	}
+	encrypted := seal(t, c, plaintext)
 	if !bytes.Equal(encrypted, plaintext) {
 		t.Error("disabled cipher should return plaintext as-is")
 	}
@@ -34,31 +69,18 @@ func TestCipherDisabled(t *testing.T) {
 	if !bytes.Equal(decrypted, plaintext) {
 		t.Error("disabled cipher decrypt should return ciphertext as-is")
 	}
-
-	if c.NonceSize() != 0 {
-		t.Errorf("disabled cipher NonceSize = %d, want 0", c.NonceSize())
-	}
-	if c.Overhead() != 0 {
-		t.Errorf("disabled cipher Overhead = %d, want 0", c.Overhead())
-	}
 }
 
 func TestCipherRoundTrip(t *testing.T) {
-	c := mustNew(t, "mysecretkey")
+	c := mustSession(t, "mysecretkey")
 	plaintext := []byte("The quick brown fox jumps over the lazy dog")
 
-	encrypted, err := c.Encrypt(plaintext)
-	if err != nil {
-		t.Fatal(err)
-	}
+	encrypted := seal(t, c, plaintext)
 	if bytes.Equal(encrypted, plaintext) {
 		t.Error("encrypted data should differ from plaintext")
 	}
-	// GCM overhead = 12-byte nonce + 16-byte auth tag = 28 bytes
-	expectedLen := len(plaintext) + c.NonceSize() + c.Overhead()
-	if len(encrypted) != expectedLen {
-		t.Errorf("encrypted length = %d, want %d (plaintext %d + nonce %d + tag %d)",
-			len(encrypted), expectedLen, len(plaintext), c.NonceSize(), c.Overhead())
+	if want := len(plaintext) + overhead; len(encrypted) != want {
+		t.Errorf("encrypted length = %d, want %d", len(encrypted), want)
 	}
 
 	decrypted, err := c.Decrypt(encrypted)
@@ -71,11 +93,11 @@ func TestCipherRoundTrip(t *testing.T) {
 }
 
 func TestCipherDifferentNonce(t *testing.T) {
-	c := mustNew(t, "testkey")
+	c := mustSession(t, "testkey")
 	plaintext := []byte("same input twice")
 
-	enc1, _ := c.Encrypt(plaintext)
-	enc2, _ := c.Encrypt(plaintext)
+	enc1 := seal(t, c, plaintext)
+	enc2 := seal(t, c, plaintext)
 
 	if bytes.Equal(enc1, enc2) {
 		t.Error("two encryptions of the same plaintext should produce different ciphertext (different nonce)")
@@ -89,30 +111,27 @@ func TestCipherDifferentNonce(t *testing.T) {
 }
 
 func TestCipherTamperDetection(t *testing.T) {
-	c := mustNew(t, "tamperkey")
+	c := mustSession(t, "tamperkey")
 	plaintext := []byte("sensitive data that must not be tampered with")
 
-	encrypted, err := c.Encrypt(plaintext)
-	if err != nil {
-		t.Fatal(err)
-	}
+	encrypted := seal(t, c, plaintext)
 
 	// Flip a bit in the ciphertext portion (after the nonce)
 	tampered := make([]byte, len(encrypted))
 	copy(tampered, encrypted)
-	tampered[c.NonceSize()+1] ^= 0xFF
+	tampered[13] ^= 0xFF // first bytes after the nonce
 
-	_, err = c.Decrypt(tampered)
+	_, err := c.Decrypt(tampered)
 	if err == nil {
 		t.Error("decrypting tampered ciphertext should return an error")
 	}
 }
 
 func TestCipherTruncatedCiphertext(t *testing.T) {
-	c := mustNew(t, "trunckey")
+	c := mustSession(t, "trunckey")
 
 	// Too short: less than nonce + auth tag
-	short := make([]byte, c.NonceSize()+c.Overhead()-1)
+	short := make([]byte, overhead-1)
 	_, err := c.Decrypt(short)
 	if err == nil {
 		t.Error("decrypting truncated ciphertext should return an error")
@@ -120,30 +139,13 @@ func TestCipherTruncatedCiphertext(t *testing.T) {
 }
 
 func TestCipherWrongKey(t *testing.T) {
-	c1 := mustNew(t, "key-one")
-	c2 := mustNew(t, "key-two")
+	c1 := mustSession(t, "key-one")
+	c2 := mustSession(t, "key-two")
 	plaintext := []byte("encrypted with key one")
 
-	encrypted, err := c1.Encrypt(plaintext)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	_, err = c2.Decrypt(encrypted)
+	_, err := c2.Decrypt(seal(t, c1, plaintext))
 	if err == nil {
 		t.Error("decrypting with wrong key should return an error")
-	}
-}
-
-func TestCipherNonceAndOverhead(t *testing.T) {
-	c := mustNew(t, "sizecheck")
-
-	// Standard GCM: 12-byte nonce, 16-byte auth tag
-	if c.NonceSize() != 12 {
-		t.Errorf("NonceSize = %d, want 12", c.NonceSize())
-	}
-	if c.Overhead() != 16 {
-		t.Errorf("Overhead = %d, want 16", c.Overhead())
 	}
 }
 
@@ -160,7 +162,7 @@ func TestEncryptFrame(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := mustNew(t, tt.key)
+			c := mustSession(t, tt.key)
 
 			frame, err := c.EncryptFrame(tt.data)
 			if err != nil {
@@ -202,7 +204,7 @@ func TestEncryptFrameSizeLimit(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := mustNew(t, tt.key)
+			c := mustSession(t, tt.key)
 
 			frame, err := c.EncryptFrame(make([]byte, tt.size))
 

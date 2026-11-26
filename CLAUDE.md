@@ -31,6 +31,9 @@ cd go
 # Run tests
 go test ./... -v -count=1
 
+# End-to-end tests (Linux, root and iproute2)
+go test -exec "sudo env MULTICAST_RELAY_E2E=1" ./cmd/... -run EndToEnd -v -count=1
+
 # Vet
 go vet ./...
 
@@ -43,17 +46,18 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm64  go build -ldflags="-s -w" -o ../bin/multi
 CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -ldflags="-s -w" -o ../bin/multicast-relay-armv7 ./cmd/multicast-relay/
 ```
 
-Releases are published with `./release.sh` (requires `gh` CLI).
+Releases are published with `./release.sh vX.Y [notes-file]` from a clean checkout of `master` (requires `gh` CLI).
 
 ## Key Architecture Notes
 
 - **Raw sockets**: uses `AF_PACKET` sockets for packet capture and transmission (Linux only).
 - **Event loop**: single-threaded, driven by `unix.Poll()` in `relay_loop.go:Loop()`. The timeout is 1 s, or 100 ms when a remote relay is configured, because remote packets arrive on a channel rather than the poll fd set and the timeout bounds their latency.
-- **Duplicate suppression**: ring buffer of 256 recent IP checksums, recording both received and transmitted values, prevents re-relaying the same packet.
+- **Duplicate suppression**: ring buffer of 256 recent packet fingerprints (IP ID, TTL, addresses, ports and payload), recorded on receipt and on transmit and expiring after 2 s.
+- **Receive sockets**: multicast sockets clear `IP_MULTICAST_ALL` and broadcast sockets are bound to one interface each (subnet and limited broadcast), so unlisted interfaces are not heard.
 - **Remote relay**: TCP transport with 2-byte length-prefixed framing and a reader and writer goroutine per connection; optional AES-256-GCM via `--aes`, with mutual authentication and per-connection, per-direction session keys.
-- **Interface recovery**: auto-recreates transmit sockets on `ENXIO` errors.
+- **Interface recovery**: the loop checks listed interfaces every 2 s and reopens all sockets when one is recreated or readdressed. After `--drop-user` it exits instead.
 - **Buffer reuse**: `sync.Pool` for packet buffers.
-- **Module**: `github.com/mojo333/multicast-relay`, Go 1.24, single external dependency `golang.org/x/sys`.
+- **Module**: `github.com/mojo333/multicast-relay`, Go 1.27, single external dependency `golang.org/x/sys`.
 
 ## Target Platforms
 

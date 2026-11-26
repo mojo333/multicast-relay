@@ -15,11 +15,16 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
 
       - name: Run tests
         working-directory: go
         run: go test ./... -v -count=1 -race
+
+      - name: Run end-to-end tests
+        working-directory: go
+        run: go test -exec "sudo env MULTICAST_RELAY_E2E=1" ./cmd/... -run EndToEnd -v -count=1 -race
 
       - name: Run vet
         working-directory: go
@@ -46,17 +51,8 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
-
-      - name: Cache Go modules
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/go-build
-            ${{ env.GOMODCACHE }}
-          key: ${{ runner.os }}-go-1.24-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-1.24-
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
 
       - name: Build
         working-directory: go

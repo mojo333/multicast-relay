@@ -1,60 +1,63 @@
 #!/usr/bin/env bash
+# Builds the Linux binaries and publishes them as a new GitHub release.
+# Usage: ./release.sh vX.Y [notes-file]
+# The notes file is added above the generated notes, for upgrade warnings.
 set -euo pipefail
 
 REPO="mojo333/multicast-relay"
-TAG="v2.8"
-TARGET="master"
+
+die() { echo "release: $*" >&2; exit 1; }
+
+TAG="${1:-}"
+[[ ${TAG} =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || die "usage: ./release.sh vX.Y [notes-file]"
+
+NOTES=()
+if [[ -n ${2:-} ]]; then
+  [[ -f $2 ]] || die "notes file $2 not found"
+  # Made absolute because the script changes directory.
+  NOTES=(--notes-file "$(cd "$(dirname "$2")" && pwd)/$(basename "$2")")
+fi
+
+cd "$(dirname "$0")"
+
+# Release only what is on master, so that the tag matches the binaries.
+[[ -z "$(git status --porcelain)" ]] || die "the checkout has uncommitted changes"
+git fetch --quiet origin master
+COMMIT="$(git rev-parse HEAD)"
+[[ ${COMMIT} == "$(git rev-parse origin/master)" ]] || die "HEAD does not match origin/master"
+
+# An existing release is never replaced.
+EXISTING="$(git ls-remote --tags origin "refs/tags/${TAG}")"
+[[ -z ${EXISTING} ]] || die "tag ${TAG} already exists"
+
 BINDIR="$(mktemp -d)"
+trap 'rm -rf "${BINDIR}"' EXIT
 
-echo "==> Deleting existing ${TAG} release and tag..."
-gh release delete "${TAG}" --repo "${REPO}" --yes --cleanup-tag 2>/dev/null || true
+cd go
+# Build with the Go version that go.mod names and CI tests.
+GOTOOLCHAIN="go$(sed -n 's/^go //p' go.mod)"
+export GOTOOLCHAIN
 
-echo "==> Cross-compiling binaries..."
-cd "$(dirname "$0")/go"
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64       go build -ldflags="-s -w -X main.version=${TAG}" -o "${BINDIR}/multicast-relay-amd64" ./cmd/multicast-relay/
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64       go build -ldflags="-s -w -X main.version=${TAG}" -o "${BINDIR}/multicast-relay-arm64" ./cmd/multicast-relay/
-CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -ldflags="-s -w -X main.version=${TAG}" -o "${BINDIR}/multicast-relay-armv7" ./cmd/multicast-relay/
-
-echo "==> Built binaries:"
+echo "==> Cross-compiling ${TAG} with ${GOTOOLCHAIN}..."
+build() {
+  CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X main.version=${TAG}" \
+    -o "${BINDIR}/multicast-relay-$1" ./cmd/multicast-relay/
+}
+GOARCH=amd64 build amd64
+GOARCH=arm64 build arm64
+GOARCH=arm GOARM=7 build armv7
 ls -lh "${BINDIR}"/multicast-relay-*
-file "${BINDIR}"/multicast-relay-*
 
-echo "==> Creating ${TAG} release on ${TARGET}..."
-NOTES_FILE="${BINDIR}/notes.md"
-cat > "${NOTES_FILE}" <<'EOF'
-## What's Changed since v2.7
-
-### Fixes
-- `ComputeUDPChecksum` now transmits a computed checksum of 0 as
-  `0xffff`, per RFC 768 (`0x0000` on the wire means "no checksum").
-- Dropped the main event loop's poll timeout from 1000ms to 100ms,
-  bounding the latency of packets arriving over `--remote`/`--listen`
-  TCP mesh connections during local idle.
-
-### CI
-- Test suite now runs with `-race` to cover the remote-mesh
-  accept/dial goroutines.
-
-## Binaries
-
-Statically linked Linux binaries (no CGO, stripped):
-
-- `multicast-relay-amd64` — Linux x86_64
-- `multicast-relay-arm64` — Linux aarch64
-- `multicast-relay-armv7` — Linux ARMv7 (e.g. Raspberry Pi)
-EOF
-
+echo "==> Creating release ${TAG} at ${COMMIT}..."
 gh release create "${TAG}" \
   --repo "${REPO}" \
-  --target "${TARGET}" \
+  --target "${COMMIT}" \
   --title "${TAG}" \
-  --notes-file "${NOTES_FILE}" \
+  --generate-notes \
+  ${NOTES[@]+"${NOTES[@]}"} \
   "${BINDIR}/multicast-relay-amd64" \
   "${BINDIR}/multicast-relay-arm64" \
   "${BINDIR}/multicast-relay-armv7"
 
-echo "==> Cleaning up..."
-rm -rf "${BINDIR}"
-
-echo "==> Done. Release ${TAG} created."
+echo "==> Done."
 gh release view "${TAG}" --repo "${REPO}"

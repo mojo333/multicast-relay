@@ -39,6 +39,7 @@ func TestBroadcastIsReaddressedPerInterface(t *testing.T) {
 			b, bOut := socketTransmitter(t, "b", "192.168.2.1")
 			c, cOut := socketTransmitter(t, "c", "192.168.3.1")
 			pr.transmitters = []Transmitter{rx, b, c}
+			listenOn(pr, pr.transmitters...)
 
 			// A remote sender sits on a subnet that no local interface owns.
 			src, dst := "192.168.1.100", "192.168.1.255"
@@ -47,7 +48,7 @@ func TestBroadcastIsReaddressedPerInterface(t *testing.T) {
 			}
 			packet := minUDPTestPacket(src, dst, 1234, 6969)
 			ComputeIPChecksum(packet, 20)
-			pr.processPacket(packet, netip.MustParseAddr(src), source)
+			pr.processPacket(packet, netip.MustParseAddr(src), source, nil)
 
 			for _, out := range []struct {
 				fd   int

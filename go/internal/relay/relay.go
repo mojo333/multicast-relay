@@ -2,27 +2,26 @@
 package relay
 
 import (
+	"bytes"
+	"cmp"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"net"
 	"net/netip"
 	"os"
-	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/mojo333/multicast-relay/internal/cipher"
-
-	"golang.org/x/sys/unix"
 )
 
 // Protocol constants matching the Python version.
 const (
-	MulticastMin    = "224.0.0.0"
-	MulticastMax    = "239.255.255.255"
 	BroadcastAddr   = "255.255.255.255"
 	SSDPMcastAddr   = "239.255.255.250"
 	SSDPMcastPort   = 1900
@@ -30,16 +29,18 @@ const (
 	MDNSMcastAddr   = "224.0.0.251"
 	MDNSMcastPort   = 5353
 
-	udpMaxLength       = 1456 // must be a multiple of 8 for IP fragmentation alignment
-	maxRecentChecksums = 256
+	udpMaxLength     = 1456 // must be a multiple of 8 for IP fragmentation alignment
+	maxRecentPackets = 256
 
-	// ethPAllBE is ETH_P_ALL in network byte order (big-endian).
-	ethPAllBE = (unix.ETH_P_ALL>>8)&0xff | (unix.ETH_P_ALL&0xff)<<8
+	// dedupWindow is how long a packet is remembered. Loops come back within
+	// milliseconds, while a longer memory would swallow genuine repeats from
+	// devices that never change their IP packet ID.
+	dedupWindow = 2 * time.Second
 
 	// remoteWriteTimeout bounds a single write to a remote peer inside its writer
 	// goroutine. remoteWriteQueueLen bounds how many frames may be buffered for a
 	// slow peer before new frames are dropped.
-	remoteWriteTimeout  = 100 * time.Millisecond
+	remoteWriteTimeout  = 5 * time.Second
 	remoteWriteQueueLen = 256
 
 	// arpCacheTTL is how long a resolved IP→MAC mapping is reused before the ARP
@@ -74,7 +75,10 @@ var (
 	magicBytes = [4]byte{'M', 'R', 'L', 'Y'}
 	zeroMAC    = net.HardwareAddr{0, 0, 0, 0, 0, 0}
 
-	ssdpSearchRe = regexp.MustCompile(`M-SEARCH|NOTIFY`)
+	ssdpSearchPrefix = []byte("M-SEARCH")
+
+	// dedupSeed keys the duplicate filter's hash for this process.
+	dedupSeed = maphash.MakeSeed()
 
 	ssdpMcastNetip = netip.MustParseAddr(SSDPMcastAddr)
 	mdnsMcastNetip = netip.MustParseAddr(MDNSMcastAddr)
@@ -142,6 +146,7 @@ func New(cfg Config) (*PacketRelay, error) {
 		masquerade:           masq,
 		logger:               cfg.Logger,
 		etherAddrs:           make(map[netip.Addr]net.HardwareAddr),
+		matchedNames:         make(map[string]string),
 		remoteWriters:        make(map[net.Conn]*remoteWriter),
 		remotePacketCh:       make(chan remotePacket, 256),
 		remoteFailedCh:       make(chan net.Conn, 16),
@@ -199,6 +204,7 @@ func parseIfFilterFile(path string) ([]parsedFilter, error) {
 		return nil, fmt.Errorf("cannot parse ifFilter JSON: %w", err)
 	}
 	var filters []parsedFilter
+	seen := make(map[netip.Prefix]bool, len(raw))
 	for netStr, ifaces := range raw {
 		// If no CIDR suffix, default to /32
 		if !strings.Contains(netStr, "/") {
@@ -208,63 +214,50 @@ func parseIfFilterFile(path string) ([]parsedFilter, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid CIDR in ifFilter key %q: %w", netStr, err)
 		}
+		prefix = prefix.Masked()
+		if seen[prefix] {
+			return nil, fmt.Errorf("ifFilter has more than one rule for %s", prefix)
+		}
+		seen[prefix] = true
 		filters = append(filters, parsedFilter{
 			prefix: prefix,
 			ifaces: ifaces,
 		})
 	}
+	// The most specific rule wins. Map iteration order must not decide it.
+	slices.SortFunc(filters, func(a, b parsedFilter) int {
+		return cmp.Or(cmp.Compare(b.prefix.Bits(), a.prefix.Bits()), a.prefix.Addr().Compare(b.prefix.Addr()))
+	})
 	return filters, nil
 }
 
-// Close signals the relay loop to stop and cleans up resources.
+// Close signals the relay loop to stop. The loop owns the sockets and closes
+// them as it returns, so Close is safe to call from another goroutine.
 func (pr *PacketRelay) Close() {
-	select {
-	case <-pr.done:
-		return // already closed
-	default:
+	pr.closeOnce.Do(func() {
 		close(pr.done)
-	}
+		if pr.listener != nil {
+			pr.listener.Close()
+		}
+	})
+}
 
-	// Close listener
-	if pr.listener != nil {
-		pr.listener.Close()
-	}
-
-	// Close all remote connections
-	for _, conn := range pr.remoteConnections {
+// cleanUp closes the remote connections and the relay sockets.
+func (pr *PacketRelay) cleanUp() {
+	for _, conn := range pr.remoteSockets() {
 		conn.Close()
 	}
-	for _, ra := range pr.remoteAddrs {
-		if ra.Conn != nil {
-			ra.Conn.Close()
-		}
-	}
-
-	// Close receiver sockets
-	for _, rx := range pr.receivers {
-		unix.Close(rx.fd)
-	}
-
-	// Close transmitter sockets
-	for _, tx := range pr.transmitters {
-		unix.Close(tx.Socket)
-	}
+	closeSockets(pr.receivers, pr.transmitters)
+	pr.receivers, pr.transmitters = nil, nil
 }
 
 // processPacket processes an incoming packet and relays it to other interfaces.
-func (pr *PacketRelay) processPacket(data []byte, senderAddr netip.Addr, receivingInterface string) {
+// receivingInterface is a local interface name, "local" when the sender's address
+// has to identify it, or "remote" with from set to the connection it arrived on.
+func (pr *PacketRelay) processPacket(data []byte, senderAddr netip.Addr, receivingInterface string, from net.Conn) {
 	if len(data) < minUDPPacketLen {
 		return
 	}
-
-	// Dedup on both checksums: the received one (recorded here) stops a remote
-	// peer bouncing the unmodified packet back, and the transmitted one (recorded
-	// in transmitPacket) stops our rewritten packet looping on a local interface.
-	ipChecksum := binary.BigEndian.Uint16(data[10:12])
-	if pr.isDuplicate(ipChecksum) {
-		return
-	}
-	pr.addChecksum(ipChecksum)
 
 	// IP header length
 	ipHeaderLength := int(data[0]&0x0f) * 4
@@ -272,9 +265,57 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr netip.Addr, receivi
 		return
 	}
 
+	// Remember the packet as received. transmitPacket also remembers it as sent,
+	// which stops a rewritten packet looping on a local interface.
+	key := dedupKey(data, ipHeaderLength)
+	if pr.isDuplicate(key) {
+		return
+	}
+	pr.remember(key)
+
+	srcAddr := AddrFrom4Bytes(data[12:16])
+	dstAddr := AddrFrom4Bytes(data[16:20])
+	srcPort := binary.BigEndian.Uint16(data[ipHeaderLength : ipHeaderLength+2])
+	dstPort := binary.BigEndian.Uint16(data[ipHeaderLength+2 : ipHeaderLength+4])
+
+	origSrcAddr := srcAddr
+	origDstAddr := dstAddr
+	origDstPort := dstPort
+
+	// Determine receiving interface
+	broadcastPacket := false
+	switch receivingInterface {
+	case "local":
+		receivingInterface, broadcastPacket = pr.findReceivingIface(senderAddr, origDstAddr)
+	case "remote":
+		// A broadcast packet arriving over the remote relay carries the sending
+		// site's subnet broadcast as its destination, which never equals any
+		// local interface's broadcast. Recognize it here so it can be re-broadcast
+		// onto local interfaces instead of being silently dropped.
+		broadcastPacket = pr.isRemoteBroadcast(origDstAddr, origDstPort)
+	default:
+		broadcastPacket = pr.isBroadcastOn(receivingInterface, origDstAddr)
+	}
+
+	// SSDP unicast replies arrive on an ordinary address, which any network can
+	// reach, so only accept them from a listed one.
+	if pr.ssdpUnicastAddr.IsValid() && origDstAddr == pr.ssdpUnicastAddr &&
+		receivingInterface == "" && !pr.oneInterface {
+		return
+	}
+
 	// Forward to remote connections with original TTL (before local TTL rewrite).
-	remotes := pr.remoteSockets()
-	if len(remotes) > 0 && !(receivingInterface == "remote" && pr.noRemoteRelay) {
+	// Local receive sockets also see other ports, which stay on this site.
+	var remotes []net.Conn
+	switch {
+	case receivingInterface == "remote":
+		if !pr.noRemoteRelay {
+			remotes = pr.remoteSockets()
+		}
+	case pr.isRelayed(origDstAddr, origDstPort, broadcastPacket):
+		remotes = pr.remoteSockets()
+	}
+	if len(remotes) > 0 {
 		senderIPBytes := senderAddr.As4()
 		seq := pr.remoteSeq
 		pr.remoteSeq++
@@ -292,7 +333,9 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr netip.Addr, receivi
 		// writing inline: a slow or stalled remote peer must never block the
 		// single-threaded event loop and stall local relaying.
 		for _, conn := range remotes {
-			pr.queueRemoteFrame(conn, packet)
+			if conn != from {
+				pr.queueRemoteFrame(conn, packet)
+			}
 		}
 	}
 
@@ -302,35 +345,15 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr netip.Addr, receivi
 		data[8] = byte(pr.ttl)
 	}
 
-	srcAddr := AddrFrom4Bytes(data[12:16])
-	dstAddr := AddrFrom4Bytes(data[16:20])
-	srcPort := binary.BigEndian.Uint16(data[ipHeaderLength : ipHeaderLength+2])
-	dstPort := binary.BigEndian.Uint16(data[ipHeaderLength+2 : ipHeaderLength+4])
-
-	origDstAddr := dstAddr
-	origDstPort := dstPort
-
 	// mDNS unicast forcing
 	data = pr.applyMDNS(data, ipHeaderLength, dstAddr, dstPort)
 
-	// SSDP M-SEARCH / NOTIFY interception
+	// SSDP M-SEARCH interception and unicast reply routing
 	var destMac net.HardwareAddr
 	var drop bool
 	data, srcAddr, srcPort, dstAddr, dstPort, destMac, drop = pr.handleSSDP(data, ipHeaderLength, srcAddr, srcPort, dstAddr, dstPort)
 	if drop {
 		return
-	}
-
-	// Determine receiving interface
-	broadcastPacket := false
-	if receivingInterface == "local" {
-		receivingInterface, broadcastPacket = pr.findReceivingIface(senderAddr, origDstAddr, origDstPort)
-	} else if receivingInterface == "remote" {
-		// A broadcast packet arriving over the remote relay carries the sending
-		// site's subnet broadcast as its destination, which never equals any
-		// local interface's broadcast. Recognize it here so it can be re-broadcast
-		// onto local interfaces instead of being silently dropped.
-		broadcastPacket = pr.isRemoteBroadcast(origDstAddr, origDstPort)
 	}
 
 	// Relay to all other interfaces
@@ -341,8 +364,13 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr netip.Addr, receivi
 			continue
 		}
 
-		// Apply ifFilter
-		if !pr.isAllowedByFilter(srcAddr, tx.Interface) {
+		// Apply ifFilter to the real sender, not a rewritten source address.
+		if !pr.isAllowedByFilter(origSrcAddr, tx.Interface) {
+			continue
+		}
+
+		// A resolved unicast reply belongs only on the searcher's network.
+		if destMac != nil && !pr.oneInterface && !tx.Network.Contains(dstAddr) {
 			continue
 		}
 
@@ -357,8 +385,7 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr netip.Addr, receivi
 		}
 
 		if localOrigDstAddr == tx.Relay.Addr && int(origDstPort) == tx.Relay.Port &&
-			(pr.oneInterface || !OnNetwork(senderAddr, tx.Network)) {
-
+			(pr.oneInterface || !tx.Network.Contains(senderAddr)) {
 			if localDestMac == nil {
 				localDestMac = pr.etherAddrs[localDstAddr]
 			}
@@ -405,19 +432,24 @@ func (pr *PacketRelay) processPacket(data []byte, senderAddr netip.Addr, receivi
 					localDstAddr, dstPort, tx.Interface, tx.Addr)
 			}
 
-			if err := pr.transmitPacket(tx, localDestMac, ipHeaderLength, txData); err != nil {
-				// Try to recover if ENXIO (device not configured)
-				if err == unix.ENXIO {
-					pr.recoverTransmitter(tx, localDestMac, ipHeaderLength, txData)
-				} else {
-					pr.logger.Warning("Error sending packet: %s", err)
-				}
-			}
+			pr.noteSendResult(tx, pr.transmitPacket(tx, localDestMac, ipHeaderLength, txData))
 			if txBp != nil {
 				putBuffer(txBp)
 			}
 		}
 	}
+}
+
+// noteSendResult logs when sending on a transmitter starts failing and when it
+// works again, rather than once for every packet in between.
+func (pr *PacketRelay) noteSendResult(tx *Transmitter, err error) {
+	switch {
+	case err != nil && !tx.sendFailing:
+		pr.logger.Warning("Error sending packet on %s: %s", tx.Interface, err)
+	case err == nil && tx.sendFailing:
+		pr.logger.Warning("Sending on %s works again", tx.Interface)
+	}
+	tx.sendFailing = err != nil
 }
 
 // applyMDNS sets the UNICAST-RESPONSE bit in mDNS query packets when mdnsForceUnicast is enabled.
@@ -434,7 +466,8 @@ func (pr *PacketRelay) applyMDNS(data []byte, ipHeaderLength int, dstAddr netip.
 func (pr *PacketRelay) handleSSDP(data []byte, ipHeaderLength int, srcAddr netip.Addr, srcPort uint16, dstAddr netip.Addr, dstPort uint16) (outData []byte, outSrcAddr netip.Addr, outSrcPort uint16, outDstAddr netip.Addr, outDstPort uint16, destMac net.HardwareAddr, drop bool) {
 	outData, outSrcAddr, outSrcPort, outDstAddr, outDstPort = data, srcAddr, srcPort, dstAddr, dstPort
 
-	if pr.ssdpUnicastAddr.IsValid() && dstAddr == ssdpMcastNetip && dstPort == SSDPMcastPort && ssdpSearchRe.Match(data[ipHeaderLength+8:]) {
+	// Announcements (NOTIFY) are not searches and must not take over the replies.
+	if pr.ssdpUnicastAddr.IsValid() && dstAddr == ssdpMcastNetip && dstPort == SSDPMcastPort && bytes.HasPrefix(data[ipHeaderLength+8:], ssdpSearchPrefix) {
 		pr.ssdpSrc.addr = srcAddr
 		pr.ssdpSrc.port = srcPort
 		pr.ssdpSrc.set = true
@@ -494,17 +527,37 @@ func (pr *PacketRelay) resolveUnicastMAC(ip netip.Addr) (net.HardwareAddr, error
 	return mac, nil
 }
 
-// findReceivingIface identifies which local interface received a packet based on destination.
-func (pr *PacketRelay) findReceivingIface(senderAddr, origDstAddr netip.Addr, origDstPort uint16) (ifaceName string, isBroadcast bool) {
-	for _, tx := range pr.transmitters {
-		if origDstAddr == tx.Relay.Addr && int(origDstPort) == tx.Relay.Port &&
-			OnNetwork(senderAddr, tx.Network) {
-			ifaceName = tx.Interface
-			isBroadcast = (origDstAddr == tx.Broadcast)
-			break
+// findReceivingIface identifies the listed interface whose network the sender
+// is on, and whether the packet was that network's broadcast.
+func (pr *PacketRelay) findReceivingIface(senderAddr, origDstAddr netip.Addr) (ifaceName string, isBroadcast bool) {
+	for _, l := range pr.listed {
+		if l.info.Network.Contains(senderAddr) {
+			return l.info.Name, origDstAddr == l.info.Broadcast
 		}
 	}
-	return
+	return "", false
+}
+
+// isBroadcastOn reports whether addr is the named interface's broadcast address.
+func (pr *PacketRelay) isBroadcastOn(ifaceName string, addr netip.Addr) bool {
+	for _, l := range pr.listed {
+		if l.info.Name == ifaceName {
+			return l.info.Broadcast == addr
+		}
+	}
+	return false
+}
+
+// isRelayed reports whether a locally received packet matches a relay rule.
+// Broadcast rules are written as 255.255.255.255 and cover every listed
+// network's broadcast address.
+func (pr *PacketRelay) isRelayed(dst netip.Addr, port uint16, broadcast bool) bool {
+	if !broadcast {
+		broadcast = slices.ContainsFunc(pr.listed, func(l listedInterface) bool { return l.info.Broadcast == dst })
+	}
+	return slices.ContainsFunc(pr.relays, func(r relayRule) bool {
+		return r.port == int(port) && (r.addr == dst || broadcast && r.addr == broadcastIP)
+	})
 }
 
 // isRemoteBroadcast reports whether a packet arriving over the remote relay is a
@@ -587,35 +640,43 @@ func (pr *PacketRelay) stopWriter(conn net.Conn) {
 	}
 }
 
-// isDuplicate checks whether this checksum was recently seen.
+// dedupKey fingerprints the parts of a packet that stay the same when it loops
+// back: IP ID, TTL, addresses, ports and payload. Lengths, fragment fields and
+// checksums are left out so that a reassembled packet still matches.
+func dedupKey(packet []byte, ipHeaderLength int) uint64 {
+	var h maphash.Hash
+	h.SetSeed(dedupSeed)
+	h.Write(packet[4:6])
+	h.WriteByte(packet[8])
+	h.Write(packet[12:20])
+	h.Write(packet[ipHeaderLength : ipHeaderLength+4])
+	h.Write(packet[ipHeaderLength+8:])
+	return h.Sum64()
+}
+
+// isDuplicate checks whether this packet was seen within dedupWindow.
 // Not safe for concurrent use — only call from the main loop goroutine.
-func (pr *PacketRelay) isDuplicate(checksum uint16) bool {
-	n := pr.checksumCount
-	if n > maxRecentChecksums {
-		n = maxRecentChecksums
-	}
-	for i := 0; i < n; i++ {
-		if pr.recentChecksums[i] == checksum {
+func (pr *PacketRelay) isDuplicate(key uint64) bool {
+	now := time.Now()
+	for i := range pr.recent {
+		if pr.recent[i].key == key && now.Sub(pr.recent[i].at) < dedupWindow {
 			return true
 		}
 	}
 	return false
 }
 
-// addChecksum records a checksum in the ring buffer.
+// remember records a packet in the ring buffer.
 // Not safe for concurrent use — only call from the main loop goroutine.
-func (pr *PacketRelay) addChecksum(checksum uint16) {
-	pr.recentChecksums[pr.checksumIdx] = checksum
-	pr.checksumIdx = (pr.checksumIdx + 1) % maxRecentChecksums
-	if pr.checksumCount < maxRecentChecksums {
-		pr.checksumCount++
-	}
+func (pr *PacketRelay) remember(key uint64) {
+	pr.recent[pr.recentIdx] = seenPacket{key: key, at: time.Now()}
+	pr.recentIdx = (pr.recentIdx + 1) % maxRecentPackets
 }
 
 // isAllowedByFilter checks the pre-parsed ifFilter rules.
 func (pr *PacketRelay) isAllowedByFilter(srcAddr netip.Addr, txInterface string) bool {
 	for _, f := range pr.parsedFilters {
-		if OnNetworkPrefix(srcAddr, f.prefix) {
+		if f.prefix.Contains(srcAddr) {
 			for _, iface := range f.ifaces {
 				if iface == txInterface {
 					return true
