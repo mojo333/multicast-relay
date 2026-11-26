@@ -2,6 +2,7 @@
 package logger
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -30,16 +31,7 @@ func New(foreground bool, logfile string, verbose bool) (*Logger, error) {
 	// Syslog handler
 	sw, err := syslog.New(syslog.LOG_INFO|syslog.LOG_DAEMON, "multicast-relay")
 	if err == nil {
-		handlers = append(handlers, slog.NewTextHandler(syslogWriter{sw}, &slog.HandlerOptions{
-			Level: level,
-			// Strip timestamp because syslog adds its own.
-			ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
-				if a.Key == slog.TimeKey {
-					return slog.Attr{}
-				}
-				return a
-			},
-		}))
+		handlers = append(handlers, newSyslogHandler(sw, level))
 	}
 
 	if foreground {
@@ -73,6 +65,20 @@ func New(foreground bool, logfile string, verbose bool) (*Logger, error) {
 	}
 
 	return &Logger{slog: slog.New(handler)}, nil
+}
+
+// newSyslogHandler formats records for syslog.
+func newSyslogHandler(sw *syslog.Writer, level slog.Level) slog.Handler {
+	return slog.NewTextHandler(syslogWriter{sw}, &slog.HandlerOptions{
+		Level: level,
+		// Strip timestamp because syslog adds its own.
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			if a.Key == slog.TimeKey {
+				return slog.Attr{}
+			}
+			return a
+		},
+	})
 }
 
 // SetMonitor opens a monitor log file that always records at Info level.
@@ -143,13 +149,23 @@ func (l *Logger) Close() {
 	}
 }
 
-// syslogWriter adapts *syslog.Writer to io.Writer.
+// syslogWriter adapts *syslog.Writer to io.Writer, sending each record with the
+// severity that matches its level.
 type syslogWriter struct {
 	w *syslog.Writer
 }
 
 func (s syslogWriter) Write(p []byte) (n int, err error) {
-	if err := s.w.Info(string(p)); err != nil {
+	// An io.Writer is not told the level, but with the timestamp stripped every
+	// record starts with it.
+	send := s.w.Info
+	switch {
+	case bytes.HasPrefix(p, []byte("level=ERROR ")):
+		send = s.w.Err
+	case bytes.HasPrefix(p, []byte("level=WARN ")):
+		send = s.w.Warning
+	}
+	if err := send(string(p)); err != nil {
 		return 0, err
 	}
 	return len(p), nil
