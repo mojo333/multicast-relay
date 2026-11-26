@@ -146,6 +146,7 @@ func New(cfg Config) (*PacketRelay, error) {
 		masquerade:           masq,
 		logger:               cfg.Logger,
 		etherAddrs:           make(map[netip.Addr]net.HardwareAddr),
+		matchedNames:         make(map[string]string),
 		remoteWriters:        make(map[net.Conn]*remoteWriter),
 		remotePacketCh:       make(chan remotePacket, 256),
 		remoteFailedCh:       make(chan net.Conn, 16),

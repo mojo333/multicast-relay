@@ -457,6 +457,23 @@ func TestEndToEnd(t *testing.T) {
 		l.eventually("multicast from the new r0", func() []string { return l.delivered(0, mdnsGroup, 5353, 1) })
 	})
 
+	for _, spec := range []string{"10.77.1.1", "10.77.1.0/24"} {
+		t.Run("follows an interface listed as "+spec+" to a new address", func(t *testing.T) {
+			l := newLab(t)
+			l.relay("relay", "--interfaces r0 --interfaces "+spec)
+			l.want(1, "before", l.delivered(1, bcast1, 6969, 0))
+			r, h := l.ns("relay"), l.ns("h1")
+			l.ip("-n " + r + " addr del 10.77.1.1/24 dev r1")
+			l.ip("-n " + r + " addr add 10.77.5.1/24 broadcast + dev r1")
+			l.ip("-n " + h + " addr del 10.77.1.2/24 dev eth0")
+			l.ip("-n " + h + " addr add 10.77.5.2/24 broadcast + dev eth0")
+			l.ip("-n " + h + " route replace default via 10.77.5.1")
+			l.eventually("broadcast from the new subnet", func() []string {
+				return l.deliveredFrom(1, "10.77.5.2", "10.77.5.255", 6969, 0)
+			})
+		})
+	}
+
 	t.Run("exits for restart when it cannot reopen after dropping privileges", func(t *testing.T) {
 		l := newLab(t)
 		p := l.relay("relay", base+" --drop-user nobody")

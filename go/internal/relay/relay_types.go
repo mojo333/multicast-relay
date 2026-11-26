@@ -154,6 +154,7 @@ type PacketRelay struct {
 
 	relays       []relayRule
 	listed       []listedInterface
+	matchedNames map[string]string // interface spec to the name it last matched
 	transmitters []Transmitter
 	receivers    []Receiver
 	reopenFailed bool                            // a failed reopening has been reported

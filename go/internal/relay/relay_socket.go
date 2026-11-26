@@ -66,7 +66,7 @@ func (pr *PacketRelay) openRule(rule relayRule, wait bool) (err error) {
 	}
 
 	for _, spec := range pr.interfaces {
-		ifInfo, err := pr.resolveInterfaceWait(spec, wait)
+		ifInfo, err := pr.resolveListed(spec, wait)
 		if err != nil {
 			return err
 		}
@@ -164,6 +164,17 @@ func openBroadcastReceiver(ifName string, addr netip.Addr, port int) (rx Receive
 	return Receiver{fd: fd, port: port, iface: ifName}, nil
 }
 
+// resolveListed resolves a listed interface. A spec given as an address or CIDR
+// block can stop matching when the address changes, so the interface it last
+// matched is then followed by name.
+func (pr *PacketRelay) resolveListed(spec string, wait bool) (*InterfaceResult, error) {
+	result, err := pr.resolveInterfaceWait(spec, wait)
+	if name, matched := pr.matchedNames[spec]; err != nil && matched {
+		return pr.resolveInterfaceWait(name, false)
+	}
+	return result, err
+}
+
 // listInterface records a listed interface, and extends the listen-only and
 // masquerade sets to its real name when they refer to it in another way.
 func (pr *PacketRelay) listInterface(spec string, info *InterfaceResult) {
@@ -171,6 +182,7 @@ func (pr *PacketRelay) listInterface(spec string, info *InterfaceResult) {
 		return
 	}
 	pr.listed = append(pr.listed, listedInterface{spec: spec, info: *info})
+	pr.matchedNames[spec] = info.Name
 	for _, set := range []map[string]bool{pr.noTransmitInterfaces, pr.masquerade} {
 		if selects(set, spec, info.Name) {
 			set[info.Name] = true
@@ -202,7 +214,7 @@ func (pr *PacketRelay) reopenChangedInterfaces() error {
 	changed, usable := false, true
 	for i := range pr.listed {
 		l := &pr.listed[i]
-		current, err := pr.resolveInterfaceWait(l.spec, false)
+		current, err := pr.resolveListed(l.spec, false)
 		if err != nil {
 			if !l.missing {
 				pr.logger.Warning("Interface %s is unavailable: %s", l.spec, err)

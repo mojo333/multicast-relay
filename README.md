@@ -90,7 +90,8 @@ assigned an address.
 
 If a listed interface is later recreated or given a new address, the relay
 notices within a few seconds and reopens its sockets once every listed interface
-is available. With `--drop-user` it no longer has permission to do that, so it
+is available. An interface listed by address or CIDR block is followed by its
+name if that no longer matches. With `--drop-user` it no longer has permission to do that, so it
 exits with an error: run it under a service manager that restarts it.
 
 `--ttl` sets the TTL on outbound packets (1-255); default leaves the TTL unchanged.
