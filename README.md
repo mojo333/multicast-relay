@@ -5,16 +5,12 @@ This is a port to Go of Al Smith's brilliant multicast-relay
 implementation originally written in Python. Additional fixes and
 optimisations have been made.
 
-To run this on a UniFi Dream Machine Pro use the command
-
-`nohup /data/multicast-relay/multicast-relay-arm64 --interfaces br0 br50 br99 </dev/null >/dev/null 2>&1 &`
-
-Ensure that the path points to the binary and that the interfaces
-are the ones you want to listen to.
-
 Useful, for example, if you have Sonos speakers on one interface, or VLAN,
 and you want to be able to control them from devices on a different
 interface/VLAN. Similar for Chromecast devices.
+
+See [Running on a UniFi Dream Machine Pro](#running-on-a-unifi-dream-machine-pro)
+for installation on that device.
 
 By default, SSDP multicast packets received on 239.255.255.250:1900 are
 relayed to the other interfaces listed, as well as multicast DNS packets
@@ -144,6 +140,55 @@ packet. Without it only warnings and errors are logged.
 
 `--monitor` writes startup, shutdown, warning and error events to the specified
 log file.
+
+Running on a UniFi Dream Machine Pro
+------------------------------------
+
+Run the relay as a systemd service, so that it is restarted if it crashes or
+is killed. These steps assume the binary is in `/data/multicast-relay/` and that
+your UDM runs the executable scripts in `/data/on_boot.d/` at start-up, which
+needs a boot script runner such as `udm-boot`.
+
+1. Create `/data/multicast-relay/multicast-relay.service`, replacing the
+   interfaces with the ones you want to relay between:
+
+   ```ini
+   [Unit]
+   Description=multicast-relay
+   Wants=network-online.target
+   After=network-online.target
+   # Never give up restarting, for example while interfaces are still coming up at boot.
+   StartLimitIntervalSec=0
+
+   [Service]
+   ExecStart=/data/multicast-relay/multicast-relay-arm64 --monitor /data/multicast-relay/multicast-relay-monitor.log --interfaces br50 br99
+   Restart=always
+   RestartSec=5
+   ```
+
+2. Create `/data/on_boot.d/10-multicast-relay.sh`:
+
+   ```sh
+   #!/bin/sh
+   # Reinstalls the unit on every boot in case a firmware update has cleared /etc.
+   cp /data/multicast-relay/multicast-relay.service /etc/systemd/system/
+   systemctl daemon-reload
+   systemctl restart multicast-relay
+   ```
+
+3. Stop any relay that is already running, for example one started with `nohup`,
+   because two relays send every packet twice. Then make the script executable
+   and run it:
+
+   ```sh
+   chmod +x /data/on_boot.d/10-multicast-relay.sh
+   /data/on_boot.d/10-multicast-relay.sh
+   ```
+
+Check it with `systemctl status multicast-relay`. The unit is deliberately not
+enabled, because the boot script installs and starts it. After editing the unit
+file or replacing the binary, run the boot script again. A mistake in the options
+makes the service restart every 5 seconds, so check the status after any change.
 
 Upgrading from v2.8 or earlier
 ------------------------------
